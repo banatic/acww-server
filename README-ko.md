@@ -136,3 +136,65 @@ python server/tools/smoke.py http://127.0.0.1:18080
 
 API 명세는 `server/API.md`, 원본 계약은 `docs/kb/hybrid/online-spec.md`,
 구조와 위협 모델은 `wiki/systems/online-server.md`.
+
+## 리버스 프록시와 HTTPS (INTEGRATE83에서 실제로 확인한 설정)
+
+이 서비스는 **평문 HTTP 한 포트**만 씁니다. TLS는 앞단의 리버스 프록시(시놀로지의 역방향
+프록시, nginx, Caddy 등) 몫입니다. 여기서 중요한 것은 **웹소켓**입니다. 아래 세 가지를
+빠뜨리면 **클라우드 세이브는 되는데 로비만 조용히 안 되는** 가장 나쁜 형태로 고장 납니다.
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl;
+    server_name nas.example.com;
+    ssl_certificate     /etc/nginx/tls/cert.pem;
+    ssl_certificate_key /etc/nginx/tls/key.pem;
+    client_max_body_size 4m;          # 세이브 한 개가 256 KB입니다
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;                        # (1) 1.0으로는 업그레이드가 안 됩니다
+        proxy_set_header Upgrade $http_upgrade;        # (2)
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;                      # (3) 로비 소켓은 원래 조용합니다
+        proxy_send_timeout 3600s;
+    }
+}
+```
+
+`Connection` 을 `upgrade` 로 고정하면 안 됩니다 — 일반 요청까지 망가집니다. 그래서 `map`
+입니다. `proxy_read_timeout` 의 기본값 60초는 기다리는 중인 사람의 로비 소켓을 끊어 버려서
+"서버가 나를 튕겼다"처럼 보입니다.
+
+**프록시 뒤에서는 `ACWW_TRUST_PROXY=1` 을 반드시 켜세요.** 켜지 않으면 로그인 시도 제한이
+모든 사람을 프록시 한 대로 보고 셉니다.
+
+**인증서가 자체 서명(직접 만든 것)이라면** 플레이어의 PC가 그것을 믿지 않아서 접속이
+실패합니다. 게임은 멈추지 않고 오프라인으로 진행하며 로그에 한 줄 남깁니다. 해결은 두
+가지이고, 순서가 있습니다.
+
+1. **인증서를 각 PC가 믿게 합니다(권장).** 관리자 권한에서 `certutil -addstore -f Root
+   cert.pem`, 되돌릴 때 `certutil -delstore Root <이름>`.
+2. `acww.exe --insecure-tls` — **시험용입니다.** 서버 인증서를 전혀 확인하지 않습니다.
+   명령줄로만 줄 수 있고(ini에 적을 수 없습니다), 쓴 실행마다 로그에 그 사실을 남깁니다.
+   집 안에서 한 번 확인해 볼 때만 쓰고, 평소에는 1번으로 두세요.
+
+둘 다 nginx + 자체 서명 인증서 앞에서 실제로 확인했습니다(로그인, 세이브 내려받기·올리기,
+로비 웹소켓 전부). 재현 방법은 `python port/tools/test_online_integration.py --only
+accounts,tls`.
+
+## 클라이언트와 함께 돌려 보기
+
+```
+python port/tools/test_online_integration.py
+```
+
+이 이미지를 빌드해서 **새 볼륨**으로 띄우고, `dist/acww.exe` 를 실제로 실행해 계정 가입,
+로그인, 세이브 왕복, 412 충돌, 오프라인, **두 개의 게임 프로세스가 로비에서 만나는 것**,
+그리고 TLS까지 7단계를 확인합니다. 도커가 없거나 exe가 없으면 그냥 건너뜁니다(exit 0).
+`server/tools/smoke.py` 는 그대로이고, 서버만 확인하고 싶을 때 쓰는 빠른 쪽입니다.

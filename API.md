@@ -85,3 +85,31 @@ the host ("inviting"), `child` the guest ("visiting").
 `/data/acww.sqlite` (`users`, `save_versions`; the lobby and the rooms are in memory) and
 `/data/saves/<user_id>/<version>.sav`. Backups are the NAS's. No ROM data ever touches the
 server.
+
+## Confirmed against the real client (INTEGRATE83, 2026-09-11)
+
+`port/tools/test_online_integration.py` runs this image on a fresh volume and drives
+`dist/acww.exe` against it -- registration through the game's own window, login, a save round
+trip with `If-Match`, a forced 412, an offline launch, two game processes meeting in the
+lobby, and the whole of it again behind an nginx TLS proxy. Seven steps, all passing.
+
+**Every contested choice on this page stood; the client changed on all five.** The list is in
+`docs/kb/hybrid/online-spec.md`, "The two halves met". In short:
+
+* `{"t":"list","users":[...]}` -- the key is `users`, and the spec now says so.
+* `user_id` is an integer here and the type checks on `invite.to` / `accept.from` /
+  `decline.from` stay. The client was sending quoted ids; **the specific error message is what
+  made that findable in a minute rather than a day, so keep it specific.**
+* `PUT /v1/save` -> 400 for an image the ROM would refuse is right even though it fires on
+  every fresh account's first launch. The client now runs the same test before the PUT.
+* `{"t":"peer_left"}` then a 1000 close to the survivor: the client now empties its relay ring
+  and returns to the waiting list on it.
+* Relay frames are forwarded or DROPPED, never buffered. A client whose instrument sent a
+  single probe on connect lost the race with the peer's join; the instrument was changed.
+
+**For anyone writing a fixture against this service:** the structured stdout events are the
+contract that made the above debuggable -- `auth.login`, `save.put` (with `if_match`),
+`save.stale`, `save.rejected` (with `reason`), `lobby.invite`, `lobby.matched` (with `parent`
+and `child`) and `relay.close` (with `frames_forwarded`). They go to **stdout**; uvicorn's
+access lines go to **stderr**, and `docker logs` returns the two as separate blocks rather
+than interleaved.
