@@ -1,0 +1,18 @@
+# The build context is `server/` and the image needs exactly two things out of it:
+# requirements.txt and app/.  Everything else is excluded -- in particular tests/, which
+# holds the owner's own 256 KB save fixture.  A player's save is not service code and must
+# not travel inside a container image that might be shared.
+tests/
+tools/
+data/
+*.md
+docker-compose.yml
+.env
+.env.*
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.sqlite
+*.sav
+.pytest_cache/

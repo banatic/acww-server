@@ -1,0 +1,32 @@
+# Synology Container Manager: Project -> Create -> "upload docker-compose.yml".
+#
+# THE SECRET IS NOT IN THIS FILE.  `${ACWW_SERVER_SECRET}` is read from the environment
+# (Container Manager's own environment box, or a `.env` beside this file that is NEVER
+# committed).  Leave it empty and the service generates one on first run and persists it
+# as ./data/secret.key -- which is fine, as long as ./data is in the backup.
+services:
+  acww-online:
+    container_name: acww-online
+    build: .
+    image: acww-online:dev
+    restart: unless-stopped
+    ports:
+      # Host 8080 -> container 8080. Put the NAS reverse proxy in front of this and do
+      # NOT open this port on the router: the service speaks plain HTTP.
+      - "8080:8080"
+    volumes:
+      # The accounts, the SQLite file and every save version. This directory IS the
+      # backup. `chown -R 10001:10001 ./data` once, because the container is non-root.
+      - ./data:/data
+    environment:
+      ACWW_SERVER_SECRET: "${ACWW_SERVER_SECRET:-}"
+      ACWW_ALLOW_REGISTER: "1"      # set to 0 once the household's accounts exist
+      ACWW_TRUST_PROXY: "1"         # the rate limiter reads X-Forwarded-For from the NAS proxy
+    healthcheck:
+      # python is already in the image; no curl is installed and none is needed.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/v1/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

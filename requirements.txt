@@ -1,0 +1,8 @@
+# Pinned exactly. A NAS rebuilds this image months apart and an unpinned resolver would
+# quietly change the service between two builds the operator believes are the same.
+fastapi==0.139.2
+uvicorn==0.37.0
+websockets==15.0.1
+PyJWT==2.13.0
+argon2-cffi==25.1.0
+bcrypt==5.0.0
