@@ -73,9 +73,82 @@ limit 10 auth attempts / minute / IP. All binary bodies are `application/octet-s
 | `GET /v1/save/history` | bearer | `[{version, sha256, size, updated_utc}]`, newest first, the last 20 |
 | `GET /v1/save/{version}` | bearer | that version's bytes + `ETag`, `X-Save-Sha256`; 404 once it is pruned |
 | `GET /v1/lobby` | bearer | `[{user_id, username, town_name, mode, since_utc}]` -- everyone waiting |
-| `WS /v1/lobby/ws` (bearer header; `?token=` deprecated) | client sends `{"t":"wait","mode":"host"\|"guest","town_name":...}` / `{"t":"leave"}` / `{"t":"invite","to":id}` / `{"t":"accept","from":id}` / `{"t":"decline","from":id}` / `{"t":"ping"}` | server pushes `{"t":"list","users":[...]}` on connect and on every change, `{"t":"invite","from":{...}}`, `{"t":"decline","from":id}`, `{"t":"matched","room":id,"peer":{...},"role":"parent"\|"child"}` to both, `{"t":"pong"}`, `{"t":"error","msg":...}` |
+| `WS /v1/lobby/ws` (bearer header; `?token=` deprecated) | client sends `{"t":"wait","mode":"host"\|"guest","town_name":...,"request_id":...}` / `{"t":"leave"}` / `{"t":"cancel","request_id":...}` / `{"t":"cancel","request_id":...,"to":id,"invite_id":n}` / `{"t":"cancel","request_id":...,"from":id,"invite_id":n}` / `{"t":"invite","to":id,"request_id":...}` / `{"t":"accept","from":id,"invite_id":n,"request_id":...}` / `{"t":"decline","from":id,"invite_id":n,"request_id":...}` / `{"t":"ping"}` | server pushes `{"t":"list","users":[...],"capabilities":["cancel","invite_id","command_request_id"]}` on connect and on every change, `{"t":"invite","from":{...},"invite_id":n}`, `{"t":"invited","to":id,"invite_id":n,"request_id":...}` to the inviter, `{"t":"cancelled","from":id,"invite_id":n}`, `{"t":"decline","from":id,"invite_id":n}`, `{"t":"matched","room":id,"peer":{...},"role":"parent"\|"child","invite_id":n}` to both, `{"t":"cancelled",...}` acknowledgment to the caller, `{"t":"pong"}`, `{"t":"error","msg":...,"request_id":...}` when a valid command id was supplied |
 | `WS /v1/relay/{room}` (bearer header; `?token=` deprecated) | only the two matched users | binary frames forwarded verbatim to the other peer; `{"t":"ping"}` -> `{"t":"pong"}`; the room closes when either side leaves and the survivor gets `{"t":"peer_left"}` |
 | `GET /v1/health` | -- | `{ok: true, version, users, waiting, rooms}` |
+
+## Cancellable waiting and invitation correlation (GATE-SERVER-CANCEL-1)
+
+The initial and changed `list` pushes carry additive `capabilities:["cancel","invite_id",
+"command_request_id"]`.  A client may use `command_request_id` to correlate an error with the
+specific command ticket that caused it; legacy clients ignore the additive capability and field.
+A new client stays in its unknown/legacy mode until it sees `cancel` in that field.  Each
+`invite` is assigned a server monotonic `invite_id`, returned in the invite push, the initiating
+`invited` acknowledgment, and both `matched` messages.  This is a correlation value, not a
+security nonce.  New clients echo it on `accept`, `decline`, and targeted `cancel`.  Omitting it
+keeps the existing `from`-only and `to`-only clients compatible; when present, it must match the
+current invitation exactly.  Sending a second invite to the same pair replaces the first id, so
+a delayed response for the old invitation cannot consume or cancel the new one.
+
+An initiating client may put `request_id` on `invite`; it follows the same non-empty string,
+64-character bound as cancellation. On success it is echoed in `{"t":"invited","to":id,
+"invite_id":n,"request_id":...}`; post-parse failures echo it in `error`. This additive acknowledgment lets a new client bind an
+outgoing invite id to the operation that created it.  Omitting `request_id` still produces the
+`invited` acknowledgment without that field for compatibility.
+
+The additive `abort_room` capability permits `{"t":"abort_room","room":n,"request_id":"..."}`
+for cancelling gate preparation after matching. Both fields are required: a positive integer
+room and the usual bounded request id. Under the lobby lock, the current connection generation
+must own a membership in that exact room. Success revokes the room and both relay generations,
+queues `{"t":"room_aborted","room":n,"by":user_id}` to both current lobby sessions, then
+queues `{"t":"room_abort_ack","room":n,"request_id":"..."}` to the requester. Connected
+relays receive `peer_left` and close with1000; absent relays can no longer join. A stale room,
+outsider, or replaced connection cannot revoke a newer visit. Failure uses correlated `error`.
+The acknowledgment proves server revocation, not completion of the client's relay cleanup;
+clients must wait for their own transport to close before resuming local dialogue.
+
+`cancel` accepts an optional `request_id`, which must be a non-empty string of at most 64
+characters and is echoed only to the caller.  A bare `{"t":"cancel","request_id":"close-1"}`
+atomically removes the caller from the waiting list and clears every pending invitation where
+the caller is either end.  The server replies with
+`{"t":"cancelled","request_id":"close-1","status":"cancelled"|"matched","waiting":bool,"removed":bool}`.
+`removed` is false for a retry after the state is already clear.  If a match won the race first,
+the reply is `status:"matched"` and adds `"room":id`; this is an informational result and never
+closes or changes that relay room.  The operation is idempotent: a retry gets an acknowledgment,
+but does not notify a peer a second time.
+
+Targeted cancellation names exactly one direction: `to` cancels the caller's outgoing invite,
+`from` cancels an incoming invite, and `to` and `from` cannot both be present.  It leaves the
+caller waiting.  The acknowledgment echoes the supplied scope (`to` or `from`) and `invite_id`
+so a client can bind it to its operation.  A supplied `invite_id` must still be current under
+the lobby lock; a stale id is a no-op and cannot remove a fresh invite.  Each affected peer receives one
+`{"t":"cancelled","from":id,"invite_id":n}` notification (or `invite_ids:[...]` when one
+operation invalidates more than one invitation to that peer).  Legacy `leave` uses the same
+atomic all-invites cleanup and peer notification, without requiring an acknowledgment field.
+
+Each lobby connection has a server-side session generation.  A replacement retires the old
+generation before returning; every `wait`, `cancel`, `invite`, `decline`, and `accept` mutation
+checks that generation while holding the lobby lock, so a delayed command from the displaced
+socket is rejected without touching the replacement's state.  Outbound lobby events use a
+per-session FIFO.  On attach, the FIFO starts with the current list and then replays pending
+invites (and an active match, if any); transitions append to that same FIFO under the state
+lock.  A retired generation's queued events are dropped, so a replacement cannot see an old
+cancel/decline/match after its replay or miss an invitation committed during socket hand-off.
+
+Cancellation and `accept` linearize on the same lock.  If cancellation acquires it first,
+`accept` receives the existing `that invite is no longer valid` error and no room is created.  If
+`accept` acquires it first, `cancel` reports `status:"matched"` and the active room remains
+untouched.  Malformed `request_id` or `invite_id` values are rejected before any state change.
+
+`request_id` is optional on `wait`, `invite`, `accept`, `decline`, and `cancel`.  For each
+recognized command, a valid non-empty string of at most 64 characters is echoed in every
+post-parse `error` generated for that command, including malformed command fields or a missing
+invitation.  The echo is omitted when the field is absent.  An invalid, empty, non-string, or
+overlong request id is rejected without echoing it, so an unvalidated value can never be used
+to complete another pending ticket. For example, an invalid-mode or invalid-town `wait`
+carrying the valid `request_id:"A"`
+returns `{"t":"error","msg":"...","request_id":"A"}`, followed by an independent
+`cancel` acknowledgment carrying only its own `request_id:"B"`.
 
 ## The relay frame contract
 

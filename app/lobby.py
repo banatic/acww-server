@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import itertools
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -90,6 +91,57 @@ class Waiter:
         }
 
 
+@dataclass(frozen=True)
+class Invitation:
+    """One directed, one-shot invitation and its server correlation value."""
+
+    inviter_id: int
+    target_id: int
+    invite_id: int
+    deadline: float
+
+
+@dataclass(frozen=True)
+class InviteOffer:
+    invitation: Invitation
+    inviter: dict
+    target: dict
+    target_socket: Any
+
+
+@dataclass(frozen=True)
+class CancelNotice:
+    """The peer socket and invitation ids invalidated by one cancellation operation."""
+
+    peer_id: int
+    socket: Any
+    invite_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """The linearized outcome of ``cancel`` or disconnect cleanup."""
+
+    status: str                  # "cancelled" or "matched"
+    waiting: bool
+    changed: bool
+    waiting_changed: bool
+    room_id: int | None
+    notices: tuple[CancelNotice, ...] = ()
+
+
+@dataclass
+class LobbySession:
+    """One lobby socket generation and its ordered outbound event queue."""
+
+    user_id: int
+    socket: Any
+    generation: int
+    outbox: deque[dict] = field(default_factory=deque)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    retired: bool = False
+
+
 @dataclass
 class Room:
     room_id: int
@@ -100,6 +152,9 @@ class Room:
     # F6. The generation the CURRENT socket of each side was registered with. A receive loop
     # holding an older one is a superseded connection and may not forward.
     gens: dict[int, int] = field(default_factory=dict)
+    invite_id: int | None = None
+    parent_public: dict | None = None
+    child_public: dict | None = None
 
     def members(self) -> tuple[int, int]:
         return (self.parent_id, self.child_id)
@@ -116,11 +171,13 @@ class LobbyState:
                  invite_ttl: float = INVITE_TTL) -> None:
         self._waiters: dict[int, Waiter] = {}
         self._sockets: dict[int, Any] = {}          # every connected lobby socket
+        self._sessions: dict[int, LobbySession] = {}
         self._rooms: dict[int, Room] = {}
         self._room_ids = itertools.count(1)
         self._gens = itertools.count(1)
-        # F4. (inviter_id, target_id) -> the monotonic deadline it stops being valid at.
-        self._invites: dict[tuple[int, int], float] = {}
+        self._invite_ids = itertools.count(1)
+        # F4. (inviter_id, target_id) -> directed invitation and its expiry/id.
+        self._invites: dict[tuple[int, int], Invitation] = {}
         self._lock = asyncio.Lock()
         self.max_lobby_sockets = int(max_lobby_sockets)
         self.max_rooms = int(max_rooms)
@@ -151,48 +208,144 @@ class LobbyState:
         slot, and refusing it would make a reconnect after a dropped connection impossible
         exactly when the lobby is busy.
         """
+        old, _session = await self.attach_session(user_id, socket)
+        return old
+
+    async def attach_session(self, user_id: int, socket: Any,
+                             bootstrap: dict | None = None) -> tuple[Any, LobbySession]:
+        """Register a socket and atomically seed its ordered replay queue.
+
+        ``bootstrap`` is normally the initial ``list`` envelope.  The current incoming and
+        outgoing invitations, followed by any active match, are appended while the same lock
+        still protects the new generation.  A replacement therefore cannot receive an event
+        from the displaced generation or miss an invitation committed during the hand-off.
+        """
         async with self._lock:
             old = self._sockets.get(user_id)
             if old is None and len(self._sockets) >= self.max_lobby_sockets:
                 raise Refused("this server is holding as many lobby connections as it will "
                               "(%d); try again in a moment" % self.max_lobby_sockets)
+            old_session = self._sessions.get(user_id)
+            if old_session is not None:
+                old_session.retired = True
+                old_session.wake.set()
+            session = LobbySession(user_id, socket, next(self._gens))
             self._sockets[user_id] = socket
+            self._sessions[user_id] = session
             w = self._waiters.get(user_id)
             if w is not None:
                 w.socket = socket
-            return old
+            if bootstrap is not None:
+                if bootstrap.get("t") == "list":
+                    bootstrap = dict(bootstrap)
+                    bootstrap["users"] = self.waiting_list()
+                self._queue_session_locked(session, bootstrap)
+            self._queue_replay_locked(session, user_id)
+            return old, session
 
     async def detach(self, user_id: int, socket: Any) -> bool:
         """Drop a socket and any wait it held. True when the list changed."""
+        changed, _notices = await self.detach_with_notices(user_id, socket)
+        return changed
+
+    async def detach_with_notices(self, user_id: int, socket: Any) -> tuple[bool, tuple[CancelNotice, ...]]:
+        """Drop a socket and atomically cancel its wait and invitations.
+
+        ``detach`` keeps its original boolean API.  The websocket endpoint uses this richer
+        form so a disconnect cannot leave the other side displaying an invitation that no
+        longer has a live owner.
+        """
         async with self._lock:
-            if self._sockets.get(user_id) is socket:
-                self._sockets.pop(user_id, None)
-                # F4. A socket that is gone cannot consent to anything: every invitation this
-                # account sent or received dies with it.
-                self._forget_invites_locked(user_id)
-            w = self._waiters.get(user_id)
-            if w is not None and w.socket is socket:
-                del self._waiters[user_id]
-                return True
-            return False
+            session = self._sessions.get(user_id)
+            if session is None or session.socket is not socket:
+                return False, ()
+            self._sockets.pop(user_id, None)
+            self._sessions.pop(user_id, None)
+            session.retired = True
+            session.outbox.clear()
+            session.wake.set()
+            result = self._cancel_locked(user_id, remove_wait=True)
+            return result.changed, result.notices
 
     async def wait(self, user_id: int, username: str, town_name: str, mode: str,
-                   socket: Any) -> None:
+                   socket: Any, generation: int | None = None) -> bool:
         async with self._lock:
+            if not self._mutation_owner_locked(user_id, socket, generation):
+                return False
             existing = self._waiters.get(user_id)
             since = existing.since_utc if existing else _utc()
             self._waiters[user_id] = Waiter(user_id, username, town_name, mode, since, socket)
+            return True
 
     async def leave(self, user_id: int) -> bool:
         async with self._lock:
-            self._forget_invites_locked(user_id)
-            return self._waiters.pop(user_id, None) is not None
+            return self._cancel_locked(user_id, remove_wait=True).changed
+
+    async def cancel(self, user_id: int, *, target_id: int | None = None,
+                     outgoing: bool | None = None,
+                     invite_id: int | None = None,
+                     socket: Any = None,
+                     generation: int | None = None) -> CancelResult:
+        """Atomically leave/cancel a pending lobby operation.
+
+        With no target this removes the caller from the waiting list and clears every invite
+        where the caller is either end.  ``outgoing=True`` scopes the operation to ``user_id ->
+        target_id`` and ``outgoing=False`` scopes it to ``target_id -> user_id``; a scoped cancel
+        deliberately leaves the caller waiting.  A supplied id must still be current under this
+        lock, so a delayed cancellation cannot remove a fresh invitation.  An active room is
+        only reported in the result: this method never mutates rooms or relay sockets.
+        """
+        async with self._lock:
+            if not self._mutation_owner_locked(user_id, socket, generation):
+                return self._cancel_rejected_locked(user_id)
+            return self._cancel_locked(user_id, target_id=target_id, outgoing=outgoing,
+                                       invite_id=invite_id, remove_wait=target_id is None)
 
     def waiter(self, user_id: int) -> Waiter | None:
         return self._waiters.get(user_id)
 
     def socket_of(self, user_id: int) -> Any:
         return self._sockets.get(user_id)
+
+    async def is_current_socket(self, user_id: int, socket: Any) -> bool:
+        """Whether ``socket`` still owns the account's current lobby generation."""
+        async with self._lock:
+            current = self._sessions.get(user_id)
+            return current is not None and current.socket is socket
+
+    async def next_session_event(self, session: LobbySession) -> dict | None:
+        """Pop one event for the current generation, waiting without holding ``_lock``."""
+        while True:
+            async with self._lock:
+                current = self._sessions.get(session.user_id)
+                if current is not session or session.retired:
+                    session.retired = True
+                    session.outbox.clear()
+                    return None
+                if session.outbox:
+                    payload = session.outbox.popleft()
+                    if not session.outbox:
+                        session.wake.clear()
+                    return payload
+                session.wake.clear()
+            await session.wake.wait()
+
+    async def broadcast_list(self, payload: dict) -> None:
+        """Append one list envelope to every current session under the state lock."""
+        async with self._lock:
+            for session in tuple(self._sessions.values()):
+                self._queue_session_locked(session, payload)
+
+    async def send_current(self, user_id: int, socket: Any, payload: dict,
+                           generation: int | None = None) -> bool:
+        """Queue a reply only when the supplied socket is still current."""
+        async with self._lock:
+            session = self._sessions.get(user_id)
+            if (session is None or session.socket is not socket or session.retired
+                    or (generation is not None and session.generation != generation)):
+                return False
+            self._queue_session_locked(session, payload)
+            return True
 
     # ---------------------------------------------------------------- invites (F4)
 
@@ -207,20 +360,66 @@ class LobbyState:
             del self._invites[key]
 
     def _expire_invites_locked(self, now: float) -> None:
-        for key in [k for k, deadline in self._invites.items() if deadline <= now]:
+        for key in [k for k, invitation in self._invites.items()
+                    if invitation.deadline <= now]:
             del self._invites[key]
 
-    async def offer_invite(self, inviter_id: int, target_id: int) -> None:
-        """Record the directed invitation `invite` just sent."""
+    async def offer_invite(self, inviter_id: int, target_id: int) -> Invitation | None:
+        """Record a directed invitation and return its server correlation id, if possible."""
+        result = await self.create_invite(inviter_id, target_id)
+        return result.invitation if result is not None else None
+
+    async def create_invite(self, inviter_id: int, target_id: int,
+                            socket: Any = None,
+                            generation: int | None = None) -> InviteOffer | None:
+        """Validate and record an invite under the same lock used by cancel and match."""
         async with self._lock:
             now = self._now()
             self._expire_invites_locked(now)
-            self._invites[(inviter_id, target_id)] = now + self.invite_ttl
+            if not self._mutation_owner_locked(inviter_id, socket, generation):
+                return None
+            inviter = self._waiters.get(inviter_id)
+            target = self._waiters.get(target_id)
+            if inviter is None or target is None:
+                return None
+            invitation = Invitation(inviter_id, target_id, next(self._invite_ids),
+                                    now + self.invite_ttl)
+            self._invites[(inviter_id, target_id)] = invitation
+            inviter_public, target_public = inviter.public(), target.public()
+            self._queue_session_locked(
+                self._sessions.get(target_id),
+                {"t": "invite", "from": inviter_public,
+                 "invite_id": invitation.invite_id},
+            )
+            return InviteOffer(invitation, inviter_public, target_public, target.socket)
 
-    async def withdraw_invite(self, inviter_id: int, target_id: int) -> bool:
-        """A decline. True when there was something to withdraw."""
+    async def withdraw_invite(self, inviter_id: int, target_id: int,
+                              invite_id: int | None = None) -> bool:
+        """A decline. A supplied id must still name the current invitation."""
+        invitation = await self.withdraw_invite_info(inviter_id, target_id, invite_id)
+        return invitation is not None
+
+    async def withdraw_invite_info(self, inviter_id: int, target_id: int,
+                                   invite_id: int | None = None,
+                                   socket: Any = None,
+                                   generation: int | None = None) -> Invitation | None:
+        """Consume a decline and return the removed invitation for peer correlation."""
         async with self._lock:
-            return self._invites.pop((inviter_id, target_id), None) is not None
+            now = self._now()
+            self._expire_invites_locked(now)
+            if not self._mutation_owner_locked(target_id, socket, generation):
+                return None
+            invitation = self._invites.get((inviter_id, target_id))
+            if invitation is None or (invite_id is not None
+                                      and invitation.invite_id != invite_id):
+                return None
+            del self._invites[(inviter_id, target_id)]
+            self._queue_session_locked(
+                self._sessions.get(inviter_id),
+                {"t": "decline", "from": target_id,
+                 "invite_id": invitation.invite_id},
+            )
+            return invitation
 
     async def pending_invites(self) -> list[tuple[int, int]]:
         async with self._lock:
@@ -229,7 +428,10 @@ class LobbyState:
 
     # ------------------------------------------------------------------ rooms
 
-    async def match(self, inviter_id: int, accepter_id: int) -> Room | None:
+    async def match(self, inviter_id: int, accepter_id: int,
+                    invite_id: int | None = None,
+                    socket: Any = None,
+                    generation: int | None = None) -> Room | None:
         """Create the room for an accepted invite and take both out of the list.
 
         None means "that invitation is not something this server is holding": no pending
@@ -242,7 +444,11 @@ class LobbyState:
         async with self._lock:
             now = self._now()
             self._expire_invites_locked(now)
-            if (inviter_id, accepter_id) not in self._invites:
+            if not self._mutation_owner_locked(accepter_id, socket, generation):
+                return None
+            invitation = self._invites.get((inviter_id, accepter_id))
+            if invitation is None or (invite_id is not None
+                                      and invitation.invite_id != invite_id):
                 return None
             a = self._waiters.get(inviter_id)
             b = self._waiters.get(accepter_id)
@@ -259,11 +465,173 @@ class LobbyState:
                 parent, child = (a, b) if a.mode == "host" else (b, a)
             else:
                 parent, child = a, b          # the invite is the thing that happened
-            room = Room(next(self._room_ids), parent.user_id, child.user_id, now)
+            room = Room(next(self._room_ids), parent.user_id, child.user_id, now,
+                        invite_id=invitation.invite_id,
+                        parent_public=parent.public(), child_public=child.public())
             self._rooms[room.room_id] = room
             self._waiters.pop(inviter_id, None)
             self._waiters.pop(accepter_id, None)
+            self._queue_session_locked(
+                self._sessions.get(parent.user_id),
+                {"t": "matched", "room": room.room_id,
+                 "peer": room.child_public, "role": "parent",
+                 "invite_id": room.invite_id},
+            )
+            self._queue_session_locked(
+                self._sessions.get(child.user_id),
+                {"t": "matched", "room": room.room_id,
+                 "peer": room.parent_public, "role": "child",
+                 "invite_id": room.invite_id},
+            )
             return room
+
+    def _active_room_locked(self, user_id: int) -> Room | None:
+        for room in self._rooms.values():
+            if user_id in room.members():
+                return room
+        return None
+
+    def _cancel_locked(self, user_id: int, *, target_id: int | None = None,
+                       outgoing: bool | None = None, invite_id: int | None = None,
+                       remove_wait: bool = True) -> CancelResult:
+        """Perform one cancellation while ``_lock`` is held."""
+        self._expire_invites_locked(self._now())
+        changed_wait = False
+        if remove_wait and target_id is None:
+            changed_wait = self._waiters.pop(user_id, None) is not None
+
+        if target_id is None:
+            keys = [key for key in self._invites if user_id in key]
+        elif outgoing is True:
+            keys = [(user_id, target_id)]
+        elif outgoing is False:
+            keys = [(target_id, user_id)]
+        else:
+            keys = []
+
+        removed: list[Invitation] = []
+        for key in keys:
+            invitation = self._invites.get(key)
+            if invitation is None:
+                continue
+            # A scoped stale id is a no-op.  A bare cancel has no id and clears all current
+            # invitations, which is exactly what closing the gate needs.
+            if target_id is not None and invite_id is not None \
+                    and invitation.invite_id != invite_id:
+                continue
+            removed.append(invitation)
+            del self._invites[key]
+
+        grouped: dict[int, list[int]] = {}
+        sockets: dict[int, Any] = {}
+        for invitation in removed:
+            peer_id = (invitation.target_id if invitation.inviter_id == user_id
+                       else invitation.inviter_id)
+            grouped.setdefault(peer_id, []).append(invitation.invite_id)
+            sockets.setdefault(peer_id, self._sockets.get(peer_id))
+        notices = tuple(CancelNotice(peer_id, sockets[peer_id], tuple(ids))
+                        for peer_id, ids in grouped.items())
+        for notice in notices:
+            payload = {"t": "cancelled", "from": user_id}
+            if len(notice.invite_ids) == 1:
+                payload["invite_id"] = notice.invite_ids[0]
+            else:
+                payload["invite_ids"] = list(notice.invite_ids)
+            self._queue_session_locked(self._sessions.get(notice.peer_id), payload)
+        room = self._active_room_locked(user_id)
+        return CancelResult("matched" if room is not None else "cancelled",
+                            user_id in self._waiters, changed_wait or bool(removed),
+                            changed_wait,
+                            room.room_id if room is not None else None, notices)
+
+    def _queue_session_locked(self, session: LobbySession | None, payload: dict) -> bool:
+        if session is None or session.retired or self._sessions.get(session.user_id) is not session:
+            return False
+        session.outbox.append(payload)
+        session.wake.set()
+        return True
+
+    def _queue_replay_locked(self, session: LobbySession, user_id: int) -> None:
+        """Append pending invitation and active-room replay after the bootstrap list."""
+        self._expire_invites_locked(self._now())
+        for invitation in self._invites.values():
+            if invitation.target_id == user_id:
+                inviter = self._waiters.get(invitation.inviter_id)
+                if inviter is not None:
+                    self._queue_session_locked(
+                        session,
+                        {"t": "invite", "from": inviter.public(),
+                         "invite_id": invitation.invite_id},
+                    )
+            elif invitation.inviter_id == user_id:
+                self._queue_session_locked(
+                    session,
+                    {"t": "invited", "to": invitation.target_id,
+                     "invite_id": invitation.invite_id},
+                )
+        room = self._active_room_locked(user_id)
+        if room is None:
+            return
+        if user_id == room.parent_id:
+            peer, role, public = room.child_id, "parent", room.child_public
+        else:
+            peer, role, public = room.parent_id, "child", room.parent_public
+        if public is None:
+            public = {"user_id": peer}
+        self._queue_session_locked(
+            session,
+            {"t": "matched", "room": room.room_id, "peer": public,
+             "role": role, "invite_id": room.invite_id},
+        )
+
+    def _mutation_owner_locked(self, user_id: int, socket: Any,
+                               generation: int | None = None) -> bool:
+        """Check the caller generation while ``_lock`` is held.
+
+        Direct LobbyState users may mutate an unattached fixture state.  Endpoint callers pass
+        their accepted generation, so a replaced or retired object can never reclaim the
+        account even after the replacement disconnects.  The socket-only form remains for
+        small in-memory callers that do not create sessions.
+        """
+        if socket is None:
+            return True
+        current = self._sockets.get(user_id)
+        session = self._sessions.get(user_id)
+        if generation is not None:
+            return (session is not None and not session.retired
+                    and session.generation == generation and session.socket is socket)
+        return current is None or current is socket
+
+    def _cancel_rejected_locked(self, user_id: int) -> CancelResult:
+        room = self._active_room_locked(user_id)
+        return CancelResult("matched" if room is not None else "cancelled",
+                            user_id in self._waiters, False, False,
+                            room.room_id if room is not None else None, ())
+
+    async def abort_room(self, room_id: int, user_id: int, socket: Any,
+                         generation: int) -> tuple[Any, ...] | None:
+        """Revoke this member's exact room; caller closes returned sockets outside the lock.
+
+        Pending-invitation cancellation deliberately cannot do this. The gate's preparation
+        Cancel needs an explicit room identity so a delayed command cannot end a later visit.
+        Revocation also covers a match whose relay sockets have not connected yet.
+        """
+        async with self._lock:
+            if not self._mutation_owner_locked(user_id, socket, generation):
+                return None
+            room = self._rooms.get(room_id)
+            if room is None or user_id not in room.members():
+                return None
+            del self._rooms[room_id]
+            sockets = tuple(room.sockets.values())
+            # Relay handlers retain the Room object. Invalidate its generations as well as
+            # the dictionary entry, so their next forwarding check observes revocation.
+            room.sockets.clear()
+            room.gens.clear()
+            for member in room.members():
+                self._queue_session_locked(self._sessions.get(member),
+                    {"t": "room_aborted", "room": room_id, "by": user_id})
+            return sockets
 
     async def join_room(self, room_id: int, user_id: int,
                         socket: Any) -> tuple[Room, int, Any] | None:

@@ -12,6 +12,7 @@ their own `Settings` and call `create_app()` several times in one process.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
@@ -35,6 +36,10 @@ MIN_PASSWORD = 8
 WS_POLICY_VIOLATION = 1008
 WS_MESSAGE_TOO_BIG = 1009          # RFC 6455's own code for "that frame was too large"
 WS_TRY_AGAIN_LATER = 1013
+MAX_REQUEST_ID = 64                 # lobby correlation is bounded before any state change
+LOBBY_CAPABILITIES = ("cancel", "invite_id", "command_request_id", "abort_room")
+REQUEST_ID_ERROR = ("request_id must be a non-empty string of at most %d characters"
+                    % MAX_REQUEST_ID)
 
 # The lobby's own vocabulary. `mode` decides the WM role at match time (lobby.py).
 MODES = ("host", "guest")
@@ -472,6 +477,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             pass
 
+    async def _lobby_send(user_id: int, websocket: WebSocket, payload: dict,
+                          generation: int | None = None) -> bool:
+        """Queue a lobby response only for the socket generation that issued it."""
+        return await lobby.send_current(user_id, websocket, payload, generation)
+
+    async def _drain_lobby(session: Any) -> None:
+        """Serialize every queued lobby event for one socket generation."""
+        while True:
+            payload = await lobby.next_session_event(session)
+            if payload is None:
+                return
+            await _send(session.socket, payload)
+
     # F5. The last list every connected socket was actually sent, as its serialized form.
     # `wait` with unchanged state used to serialize the whole list and push it to every
     # socket -- and log an event -- on every repetition, which made one account's repeated
@@ -486,13 +504,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         nothing and a slow reader would be made to hold the fast ones up (F5).  A socket
         that has never seen a list gets one at connect, outside this path.
         """
-        payload = {"t": "list", "users": lobby.waiting_list()}
+        payload = {"t": "list", "users": lobby.waiting_list(),
+                   "capabilities": list(LOBBY_CAPABILITIES)}
         blob = json.dumps(payload, ensure_ascii=False)
         if blob == last_broadcast["json"]:
             return False
         last_broadcast["json"] = blob
-        for uid in lobby.connected_ids():                # a snapshot; sends may fail
-            await _send(lobby.socket_of(uid), payload)
+        await lobby.broadcast_list(payload)
         return True
 
     def _ws_token(websocket: WebSocket, token: str) -> str:
@@ -521,8 +539,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user_id, username = int(user["id"]), user["username"]
         ip = _client_key(websocket, settings)
         await websocket.accept()
+        sender = None
         try:
-            displaced = await lobby.attach(user_id, websocket)
+            displaced, session = await lobby.attach_session(
+                user_id, websocket,
+                {"t": "list", "users": [],
+                 "capabilities": list(LOBBY_CAPABILITIES)},
+            )
+            sender = asyncio.create_task(_drain_lobby(session))
         except Refused as refused:               # F5: the lobby socket cap
             log.event("lobby.refused", level="warn", user_id=user_id, reason=refused.reason)
             await _send(websocket, {"t": "error", "msg": refused.reason})
@@ -536,11 +560,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:
                 pass
         log.event("lobby.open", user_id=user_id, username=username)
-        await _send(websocket, {"t": "list", "users": lobby.waiting_list()})
 
         try:
             while True:
                 raw = await websocket.receive_text()
+                # The socket map is the lobby session's ownership gate.  The mutator checks
+                # below close the remaining TOCTOU window when replacement races a command.
+                if not await lobby.is_current_socket(user_id, websocket):
+                    await websocket.close(code=WS_POLICY_VIOLATION)
+                    return
                 # F3. The application's own ceiling, under uvicorn's --ws-max-size: a text
                 # frame this large is not a lobby message whatever it contains, and 1009 is
                 # the code that says so.
@@ -551,8 +579,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # F5. One bucket per account AND one per address.
                 if not _spend("lobby_ops", ["user:%d" % user_id, "ip:" + ip]):
                     log.event("budget.lobby_ops", level="warn", user_id=user_id)
-                    await _send(websocket, {"t": "error",
-                                            "msg": "too many lobby messages; slow down"})
+                    await _lobby_send(user_id, websocket, {"t": "error",
+                                                            "msg": "too many lobby messages; slow down"},
+                                      session.generation)
                     await websocket.close(code=WS_TRY_AGAIN_LATER)
                     return
                 try:
@@ -560,111 +589,208 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if not isinstance(msg, dict):
                         raise ValueError
                 except Exception:
-                    await _send(websocket, {"t": "error", "msg": "a JSON object was expected"})
+                    await _lobby_send(user_id, websocket,
+                                      {"t": "error", "msg": "a JSON object was expected"},
+                                      session.generation)
                     continue
-                await _handle_lobby(websocket, user_id, username, msg)
+                await _handle_lobby(websocket, user_id, username, msg, session.generation)
         except WebSocketDisconnect:
             pass
         except Exception as exc:                              # pragma: no cover
             log.event("lobby.error", level="warn", user_id=user_id, error=repr(exc))
         finally:
-            changed = await lobby.detach(user_id, websocket)
+            changed, _notices = await lobby.detach_with_notices(user_id, websocket)
             log.event("lobby.close", user_id=user_id)
             if changed:
                 await _broadcast_list()
+            if sender is not None:
+                sender.cancel()
+                try:
+                    await sender
+                except BaseException:
+                    pass
 
     async def _handle_lobby(websocket: WebSocket, user_id: int, username: str,
-                            msg: dict) -> None:
+                            msg: dict, generation: int) -> None:
         kind = msg.get("t")
+        has_request_id = "request_id" in msg
+        request_id = msg.get("request_id")
+        request_id_valid = (not has_request_id or
+                            (type(request_id) is str and bool(request_id)
+                             and len(request_id) <= MAX_REQUEST_ID))
+
+        async def command_error(message: str) -> None:
+            payload = {"t": "error", "msg": message}
+            # Never reflect an invalid/unbounded request id.  A valid id is copied only after
+            # the complete post-parse command object has passed this bound check.
+            if has_request_id and request_id_valid:
+                payload["request_id"] = request_id
+            await _lobby_send(user_id, websocket, payload, generation)
+
+        if not request_id_valid:
+            await _lobby_send(user_id, websocket, {"t": "error", "msg": REQUEST_ID_ERROR},
+                              generation)
+            return
         if kind == "ping":
-            await _send(websocket, {"t": "pong"})
+            await _lobby_send(user_id, websocket, {"t": "pong"}, generation)
             return
         if kind == "wait":
             mode = msg.get("mode")
             if mode not in MODES:
-                await _send(websocket, {"t": "error", "msg": 'mode must be "host" or "guest"'})
+                await command_error('mode must be "host" or "guest"')
                 return
             town = msg.get("town_name") or ""
             if not isinstance(town, str) or len(town) > 32:
-                await _send(websocket, {"t": "error", "msg": "town_name must be a short string"})
+                await command_error("town_name must be a short string")
                 return
-            await lobby.wait(user_id, username, town, mode, websocket)
+            accepted = await lobby.wait(user_id, username, town, mode, websocket,
+                                        generation)
+            if not accepted:
+                return
             log.event("lobby.wait", user_id=user_id, mode=mode)
             await _broadcast_list()
             return
         if kind == "leave":
-            if await lobby.leave(user_id):
+            result = await lobby.cancel(user_id, socket=websocket, generation=generation)
+            if result.waiting_changed:
                 log.event("lobby.leave", user_id=user_id)
+                await _broadcast_list()
+            return
+        if kind == "abort_room":
+            room_id = msg.get("room")
+            if type(room_id) is not int or room_id <= 0 or not has_request_id:
+                await command_error("abort_room requires a positive room and request_id")
+                return
+            sockets = await lobby.abort_room(room_id, user_id, websocket, generation)
+            if sockets is None:
+                await command_error("that room is no longer owned by this connection")
+                return
+            # The room is already revoked under the state lock. Relay I/O is outside it;
+            # late joins/forwards cannot restore it while the close handshake completes.
+            await _lobby_send(user_id, websocket,
+                {"t": "room_abort_ack", "room": room_id, "request_id": request_id},
+                generation)
+            for relay_socket in sockets:
+                try:
+                    await _send(relay_socket, {"t": "peer_left"})
+                    await relay_socket.close(code=1000)
+                except Exception:
+                    pass
+            log.event("lobby.room_abort", user_id=user_id, room=room_id)
+            return
+        if kind == "cancel":
+            has_to, has_from = "to" in msg, "from" in msg
+            if has_to and has_from:
+                await command_error("cancel accepts either to or from, not both")
+                return
+            target = msg.get("to") if has_to else msg.get("from") if has_from else None
+            if (has_to or has_from) and (type(target) is not int or target == user_id):
+                await command_error("cancel target must be another user's id")
+                return
+            has_invite_id = "invite_id" in msg
+            raw_invite_id = msg.get("invite_id")
+            if has_invite_id and (not has_to and not has_from):
+                await command_error("invite_id requires to or from")
+                return
+            if has_invite_id and (type(raw_invite_id) is not int
+                                  or raw_invite_id <= 0):
+                await command_error("invite_id must be a positive integer")
+                return
+            result = await lobby.cancel(
+                user_id,
+                target_id=target if (has_to or has_from) else None,
+                outgoing=True if has_to else False if has_from else None,
+                invite_id=raw_invite_id,
+                socket=websocket,
+                generation=generation,
+            )
+            payload = {"t": "cancelled", "status": result.status,
+                       "waiting": result.waiting, "removed": result.changed}
+            if has_request_id:
+                payload["request_id"] = request_id
+            if has_to:
+                payload["to"] = target
+            elif has_from:
+                payload["from"] = target
+            if has_invite_id:
+                payload["invite_id"] = raw_invite_id
+            if result.room_id is not None:
+                payload["room"] = result.room_id
+            await _lobby_send(user_id, websocket, payload)
+            if result.waiting_changed:
                 await _broadcast_list()
             return
         if kind == "invite":
             target = msg.get("to")
-            if not isinstance(target, int) or target == user_id:
-                await _send(websocket, {"t": "error", "msg": "invite needs another user's id"})
+            if type(target) is not int or target == user_id:
+                await command_error("invite needs another user's id")
                 return
-            me_w, them_w = lobby.waiter(user_id), lobby.waiter(target)
-            if me_w is None:
-                await _send(websocket, {"t": "error",
-                                        "msg": "say wait before inviting"})
+            offer = await lobby.create_invite(user_id, target, websocket, generation)
+            if offer is None:
+                me_w, them_w = lobby.waiter(user_id), lobby.waiter(target)
+                if me_w is None:
+                    await command_error("say wait before inviting")
+                    return
+                if them_w is None:
+                    await command_error("that player is not waiting")
+                    return
+                # The waiters can only disappear while the lock is held.  This branch is kept
+                # for a defensive response if a future state implementation refuses an invite.
+                await command_error("that invitation could not be created")
                 return
-            if them_w is None:
-                await _send(websocket, {"t": "error", "msg": "that player is not waiting"})
-                return
-            # F4. The invitation becomes SERVER STATE here, directed and with an expiry.
-            # Until this line the server forwarded the message and remembered nothing, so
-            # `accept` had nothing to check and any waiter could be matched without consent.
-            await lobby.offer_invite(user_id, target)
             log.event("lobby.invite", user_id=user_id, to=target)
-            await _send(lobby.socket_of(target), {"t": "invite", "from": me_w.public()})
+            invited = {"t": "invited", "to": target,
+                       "invite_id": offer.invitation.invite_id}
+            if has_request_id:
+                invited["request_id"] = request_id
+            await _lobby_send(user_id, websocket, invited)
             return
         if kind == "decline":
             origin = msg.get("from")
-            if not isinstance(origin, int):
-                await _send(websocket, {"t": "error", "msg": "decline needs the inviter's id"})
+            if type(origin) is not int:
+                await command_error("decline needs the inviter's id")
+                return
+            raw_invite_id = msg.get("invite_id")
+            has_invite_id = "invite_id" in msg
+            if has_invite_id and (type(raw_invite_id) is not int
+                                  or raw_invite_id <= 0):
+                await command_error("invite_id must be a positive integer")
                 return
             # F4. A refused invitation is GONE: a later accept of it must not work.
-            await lobby.withdraw_invite(origin, user_id)
+            invitation_removed = await lobby.withdraw_invite_info(
+                origin, user_id, raw_invite_id, websocket, generation)
             log.event("lobby.decline", user_id=user_id, inviter=origin)
-            await _send(lobby.socket_of(origin), {"t": "decline", "from": user_id})
             return
         if kind == "accept":
             origin = msg.get("from")
-            if not isinstance(origin, int) or origin == user_id:
-                await _send(websocket, {"t": "error", "msg": "accept needs the inviter's id"})
+            if type(origin) is not int or origin == user_id:
+                await command_error("accept needs the inviter's id")
                 return
-            inviter_w, me_w = lobby.waiter(origin), lobby.waiter(user_id)
-            if inviter_w is None or me_w is None:
-                await _send(websocket, {"t": "error",
-                                        "msg": "that invite is no longer valid"})
+            raw_invite_id = msg.get("invite_id")
+            has_invite_id = "invite_id" in msg
+            if has_invite_id and (type(raw_invite_id) is not int
+                                  or raw_invite_id <= 0):
+                await command_error("invite_id must be a positive integer")
                 return
-            inviter_pub, me_pub = inviter_w.public(), me_w.public()
-            inviter_socket, my_socket = lobby.socket_of(origin), websocket
             # F4. `match` consumes the pending directed invitation inside the same lock it
             # creates the room under, and returns None when there is none to consume -- so a
             # bare accept, a replayed accept and a declined one are all the same refusal,
             # and two accepts of one invitation cannot both win.
             try:
-                room = await lobby.match(origin, user_id)
+                room = await lobby.match(origin, user_id, raw_invite_id, websocket, generation)
             except Refused as refused:           # F5: the room cap
                 log.event("lobby.refused", level="warn", user_id=user_id,
                           reason=refused.reason)
-                await _send(websocket, {"t": "error", "msg": refused.reason})
+                await command_error(refused.reason)
                 return
             if room is None:
-                await _send(websocket, {"t": "error", "msg": "that invite is no longer valid"})
+                await command_error("that invite is no longer valid")
                 return
-            by_id = {origin: (inviter_pub, inviter_socket), user_id: (me_pub, my_socket)}
-            parent_pub, parent_sock = by_id[room.parent_id]
-            child_pub, child_sock = by_id[room.child_id]
             log.event("lobby.matched", room=room.room_id, parent=room.parent_id,
                       child=room.child_id)
-            await _send(parent_sock, {"t": "matched", "room": room.room_id,
-                                      "peer": child_pub, "role": "parent"})
-            await _send(child_sock, {"t": "matched", "room": room.room_id,
-                                     "peer": parent_pub, "role": "child"})
             await _broadcast_list()
             return
-        await _send(websocket, {"t": "error", "msg": "unknown message type %r" % (kind,)})
+        await command_error("unknown message type %r" % (kind,))
 
     # ----------------------------------------------------------------- relay
 
