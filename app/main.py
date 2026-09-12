@@ -23,54 +23,105 @@ from starlette.concurrency import run_in_threadpool
 
 from . import logging_ as log
 from .config import SERVICE_VERSION, Settings
-from .lobby import LobbyState
+from .lobby import LobbyState, Refused
+from .savecheck import FLASH_SIZE as SAVE_BYTES
 from .savecheck import SaveRejected, sha256_hex, validate_card_image
-from .security import (HASHER, RateLimiter, hash_password, make_token, needs_rehash,
-                       read_token, verify_password)
+from .security import (HASHER, Budget, RateLimiter, hash_password, is_trusted_proxy,
+                       make_token, needs_rehash, read_token, verify_password)
 from .store import Store
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 MIN_PASSWORD = 8
 WS_POLICY_VIOLATION = 1008
+WS_MESSAGE_TOO_BIG = 1009          # RFC 6455's own code for "that frame was too large"
+WS_TRY_AGAIN_LATER = 1013
 
 # The lobby's own vocabulary. `mode` decides the WM role at match time (lobby.py).
 MODES = ("host", "guest")
 
+# F7. `_parse_if_match` has to say three different things and `None` was two of them.
+IF_MATCH_ABSENT = "absent"
+IF_MATCH_INVALID = "invalid"
+IF_MATCH_ANY = "any"
+
 
 # --------------------------------------------------------------------- helpers
 
-def _client_key(request: Request, settings: Settings) -> str:
-    """The rate limiter's bucket. Behind the NAS proxy every peer is the proxy, so the
-    forwarded header is honoured only when the operator says the proxy is really there --
-    otherwise a directly exposed server would let anyone spoof their way out of the
-    limit by inventing a header."""
-    if settings.trust_proxy:
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+def _peer_host(request_or_ws: Any) -> str:
+    client = getattr(request_or_ws, "client", None)
+    return client.host if client else "unknown"
+
+
+def _client_key(request_or_ws: Any, settings: Settings) -> str:
+    """The rate limiter's bucket: the address this request really came from.
+
+    F1.  This used to read `X-Forwarded-For`'s FIRST element whenever `ACWW_TRUST_PROXY=1`,
+    and the documented nginx line is `proxy_set_header X-Forwarded-For
+    $proxy_add_x_forwarded_for`, which PRESERVES whatever the caller sent and appends the
+    real client.  So the first element was attacker-chosen: a new invented prefix bought a
+    fresh unauthenticated login budget, and repeating somebody else's prefix spent theirs.
+
+    The rule now is the only one that is sound with an appending proxy:
+
+    * the TRANSPORT peer must itself be one of `ACWW_TRUSTED_PROXIES` -- a header from
+      anyone else is not evidence about anything and is ignored entirely;
+    * then the chain is walked from the RIGHT, because a trusted proxy appends, and the
+      right-hand end is therefore the part the proxy wrote rather than the part the caller
+      did.  The first hop from the right that is not itself a trusted proxy is the client.
+
+    `ACWW_TRUSTED_PROXIES` is empty by default, so out of the box the header does nothing at
+    all.  A single-proxy NAS that would rather not think about chains should make its proxy
+    OVERWRITE the header (`proxy_set_header X-Forwarded-For $remote_addr`); that shape is
+    correct under this rule too, since the overwritten value is the only untrusted hop.
+    """
+    peer = _peer_host(request_or_ws)
+    specs = settings.trusted_proxies
+    if not specs or not is_trusted_proxy(peer, specs):
+        return peer
+    fwd = request_or_ws.headers.get("x-forwarded-for")
+    if not fwd:
+        return peer
+    hops = [h.strip() for h in fwd.split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not is_trusted_proxy(hop, specs):
+            return hop
+    return peer
 
 
 def _etag(version: int) -> str:
     return '"%d"' % version
 
 
-def _parse_if_match(raw: str | None) -> int | None:
-    """`"7"`, `W/"7"` and `7` all mean version 7. Anything else means "no expectation"
-    rather than an error, except `*`, which means "there must be one" and is handled by
-    the caller."""
+def _parse_if_match(raw: str | None) -> int | str:
+    """An int version, or one of the three IF_MATCH_* words.
+
+    F7.  `"7"`, `W/"7"` and `7` all mean version 7 and `*` means "there must be one".
+    Anything else -- a tag LIST like `"0", "999"`, a garbage tag, an empty header -- used to
+    return `None`, which was the same value as "no header at all", so an unsupported
+    precondition SILENTLY became an unconditional write and could overwrite a newer save.
+    It is now IF_MATCH_INVALID and the caller refuses the request instead of guessing.
+    """
     if raw is None:
-        return None
+        return IF_MATCH_ABSENT
     token = raw.strip()
+    if not token:
+        return IF_MATCH_INVALID
+    if token == "*":
+        return IF_MATCH_ANY
     if token.startswith("W/"):
         token = token[2:].strip()
-    token = token.strip('"')
-    if token == "*":
-        return -1
+    if token.startswith('"'):
+        if not token.endswith('"') or len(token) < 2:
+            return IF_MATCH_INVALID
+        token = token[1:-1]
+    elif '"' in token or "," in token:
+        return IF_MATCH_INVALID
+    if "," in token or '"' in token:
+        return IF_MATCH_INVALID
     try:
         return int(token)
     except ValueError:
-        return None
+        return IF_MATCH_INVALID
 
 
 def _save_summary(row: Any) -> dict | None:
@@ -88,16 +139,41 @@ def _save_summary(row: Any) -> dict | None:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
+    # F2. Before anything can log a path: a filter on uvicorn's own loggers, which is where
+    # a websocket handshake's query string -- and the token in it -- used to be printed.
+    log.install_query_redaction()
     store = Store(settings.db_path, settings.saves_dir, settings.save_history)
-    limiter = RateLimiter(settings.auth_rate_limit, settings.auth_rate_window)
-    lobby = LobbyState()
+    limiter = RateLimiter(settings.auth_rate_limit, settings.auth_rate_window,
+                          settings.limiter_max_keys)
+    lobby = LobbyState(settings.max_lobby_sockets, settings.max_rooms, settings.invite_ttl)
+    # F5. Four buckets, because the four kinds of traffic have four different natural rates:
+    # a save is a handful of big PUTs a day, a lobby message is a keypress, a relay frame is
+    # one WM packet per 1/60 s per side. Keyed by account where there is one and by client
+    # address where there is not, and BOTH where there is (an account cannot be made cheaper
+    # to abuse by rotating addresses, and an address cannot be made cheaper by rotating
+    # accounts).
+    budgets = {
+        "http_ops": Budget(settings.http_ops_burst, settings.http_ops_per_sec),
+        "http_bytes": Budget(settings.http_bytes_burst, settings.http_bytes_per_sec),
+        "lobby_ops": Budget(settings.lobby_ops_burst, settings.lobby_ops_per_sec),
+        "relay_ops": Budget(settings.relay_ops_burst, settings.relay_ops_per_sec),
+        "relay_bytes": Budget(settings.relay_bytes_burst, settings.relay_bytes_per_sec),
+    }
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         log.event("service.start", version=SERVICE_VERSION, data_dir=str(settings.data_dir),
                   allow_register=settings.allow_register, hasher=HASHER,
                   users=store.user_count(), save_history=settings.save_history,
-                  trust_proxy=settings.trust_proxy)
+                  trusted_proxies=list(settings.trusted_proxies),
+                  ws_max_message=settings.ws_max_message,
+                  relay_frame_max=settings.relay_frame_max)
+        if settings.trust_proxy and not settings.trusted_proxies:
+            log.event("proxy.untrusted", level="warn",
+                      note="ACWW_TRUST_PROXY is set but ACWW_TRUSTED_PROXIES is empty, so "
+                           "X-Forwarded-For is IGNORED and the rate limiter's key is the "
+                           "transport peer -- which behind a proxy is the proxy. Set "
+                           "ACWW_TRUSTED_PROXIES to the proxy's address (SERVERFIX108 / F1).")
         if settings.secret_was_generated:
             log.event("secret.generated", level="warn",
                       path=str(settings.data_dir / "secret.key"),
@@ -115,6 +191,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.store = store
     app.state.limiter = limiter
     app.state.lobby = lobby
+    app.state.budgets = budgets
+
+    # ---------------------------------------------------------------- F3 / F5 helpers
+
+    async def _read_bounded(request: Request, limit: int) -> bytes:
+        """The body, or 413 -- and the 413 happens BEFORE the bytes are held.
+
+        F3.  `await request.body()` buffers whatever arrives and only then is anything
+        checked, so an unauthenticated caller could make the process hold an arbitrary
+        amount of memory before being told no.  Two gates: a declared `Content-Length`
+        above the limit is refused without reading at all, and the stream is then counted
+        chunk by chunk and abandoned the moment it passes the limit -- because a chunked
+        body declares no length, and a body that lies about its length is the interesting
+        case rather than the exotic one.
+        """
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > limit:
+                    raise HTTPException(status_code=413,
+                                        detail="at most %d bytes here" % limit)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Content-Length is not a number")
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(status_code=413, detail="at most %d bytes here" % limit)
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _spend(name: str, keys: list[str], cost: float = 1.0) -> bool:
+        """Spend `cost` from one budget against every key. All-or-nothing is deliberately
+        NOT attempted: a refusal costs nothing (security.Budget), so a caller refused on the
+        second key has not been charged for the first in any way that accumulates."""
+        bucket = budgets[name]
+        return all(bucket.spend(key, cost) for key in keys if key)
+
+    def _http_budget(request: Request, user_id: int | None, cost_bytes: int = 0) -> None:
+        keys = ["ip:" + _client_key(request, settings)]
+        if user_id is not None:
+            keys.append("user:%d" % user_id)
+        if not _spend("http_ops", keys):
+            log.event("budget.http_ops", level="warn", user_id=user_id,
+                      path=request.url.path)
+            raise HTTPException(status_code=429,
+                                detail="too many requests; slow down and retry")
+        if cost_bytes and not _spend("http_bytes", keys, float(cost_bytes)):
+            log.event("budget.http_bytes", level="warn", user_id=user_id, size=cost_bytes)
+            raise HTTPException(status_code=429,
+                                detail="too many bytes uploaded recently; retry shortly")
 
     # ------------------------------------------------------------------ auth
 
@@ -130,8 +258,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return row
 
     async def _read_credentials(request: Request) -> tuple[str, str]:
+        """The two strings, with every size checked before anything expensive happens (F3).
+
+        The order matters and is the finding: the body is bounded before it is buffered, it
+        is parsed only once it is known to be small, and the credential LENGTHS are checked
+        before `hash_password` -- argon2id over a megabyte of "password" is a CPU denial of
+        service that the auth rate limit alone does not close, because ten attempts a minute
+        of a hash that takes a second each is still ten seconds of the process a minute from
+        one unauthenticated caller.
+        """
+        raw = await _read_bounded(request, settings.max_auth_body)
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except Exception:
             raise HTTPException(status_code=400, detail="a JSON body is required")
         if not isinstance(body, dict):
@@ -141,6 +279,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not isinstance(username, str) or not isinstance(password, str):
             raise HTTPException(status_code=400,
                                 detail="username and password must both be strings")
+        if len(username.encode("utf-8")) > settings.max_username:
+            raise HTTPException(status_code=400,
+                                detail="username must be at most %d bytes"
+                                       % settings.max_username)
+        if len(password.encode("utf-8")) > settings.max_password:
+            raise HTTPException(status_code=400,
+                                detail="password must be at most %d bytes"
+                                       % settings.max_password)
         return username, password
 
     def _spend_attempt(request: Request, endpoint: str) -> None:
@@ -197,8 +343,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                              "user_id": int(row["id"])})
 
     @app.get("/v1/me")
-    async def me(authorization: str | None = Header(default=None)) -> JSONResponse:
+    async def me(request: Request,
+                 authorization: str | None = Header(default=None)) -> JSONResponse:
         user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
         latest = store.latest_version(int(user["id"]))
         return JSONResponse({"user_id": int(user["id"]), "username": user["username"],
                              "save": _save_summary(latest)})
@@ -206,8 +354,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ----------------------------------------------------------------- saves
 
     @app.get("/v1/save")
-    async def get_save(authorization: str | None = Header(default=None)) -> Response:
+    async def get_save(request: Request,
+                       authorization: str | None = Header(default=None)) -> Response:
         user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
         latest = store.latest_version(int(user["id"]))
         if latest is None:
             raise HTTPException(status_code=404, detail="this account has no save yet")
@@ -229,7 +379,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                        if_match: str | None = Header(default=None)) -> JSONResponse:
         user = _identify(authorization)
         user_id = int(user["id"])
-        data = await request.body()
+        # F7, BEFORE the body: a precondition this service cannot evaluate is a refusal, not
+        # a licence to write unconditionally. 428 is exactly "your request needs a
+        # precondition and the one you sent is not one I can apply".
+        expect = _parse_if_match(if_match)
+        if expect == IF_MATCH_INVALID:
+            log.event("save.if_match_unsupported", level="warn", user_id=user_id)
+            raise HTTPException(
+                status_code=428,
+                detail='If-Match must be one exact version -- "7", W/"7" or 7 -- or *; a tag '
+                       "list or any other form is refused rather than ignored, because "
+                       "ignoring it would overwrite whatever the server holds")
+        # F3. The card is exactly 262,144 bytes, so a body above that is refused while it is
+        # arriving rather than buffered and measured afterwards. One byte of slack so that
+        # 262,145 is still reported by validate_card_image's own "wrong size" message.
+        data = await _read_bounded(request, SAVE_BYTES + 1)
+        _http_budget(request, user_id, cost_bytes=len(data))
         try:
             validate_card_image(data)
         except SaveRejected as bad:
@@ -238,13 +403,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                       reason=bad.reason)
             raise HTTPException(status_code=400, detail=bad.reason)
 
-        expect = _parse_if_match(if_match)
         latest = store.latest_version(user_id)
         current = int(latest["version"]) if latest else 0
-        if expect == -1:                       # If-Match: *
+        if expect == IF_MATCH_ANY:             # If-Match: *
             if latest is None:
                 raise HTTPException(status_code=412, detail="there is no save to match")
             expect = current
+        if expect == IF_MATCH_ABSENT:
+            expect = None
         if expect is not None and expect != current:
             log.event("save.stale", level="warn", user_id=user_id, expected=expect,
                       current=current)
@@ -265,15 +431,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             headers={"ETag": _etag(version)})
 
     @app.get("/v1/save/history")
-    async def save_history(authorization: str | None = Header(default=None)) -> JSONResponse:
+    async def save_history(request: Request,
+                           authorization: str | None = Header(default=None)) -> JSONResponse:
         user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
         rows = store.history_rows(int(user["id"]))
         return JSONResponse([_save_summary(r) for r in rows])
 
     @app.get("/v1/save/{version}")
-    async def get_save_version(version: int,
+    async def get_save_version(version: int, request: Request,
                                authorization: str | None = Header(default=None)) -> Response:
         user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
         row = store.version_row(int(user["id"]), version)
         if row is None:
             raise HTTPException(status_code=404, detail="no such version")
@@ -288,8 +457,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ----------------------------------------------------------------- lobby
 
     @app.get("/v1/lobby")
-    async def lobby_list(authorization: str | None = Header(default=None)) -> JSONResponse:
-        _identify(authorization)
+    async def lobby_list(request: Request,
+                         authorization: str | None = Header(default=None)) -> JSONResponse:
+        user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
         return JSONResponse(lobby.waiting_list())
 
     async def _send(socket: Any, payload: dict) -> None:
@@ -301,21 +472,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             pass
 
-    async def _broadcast_list() -> None:
+    # F5. The last list every connected socket was actually sent, as its serialized form.
+    # `wait` with unchanged state used to serialize the whole list and push it to every
+    # socket -- and log an event -- on every repetition, which made one account's repeated
+    # no-op message into work proportional to the number of players connected.
+    last_broadcast: dict[str, str | None] = {"json": None}
+
+    async def _broadcast_list() -> bool:
+        """Push the waiting list to every lobby socket. False when nothing was sent.
+
+        The list is serialized ONCE and compared with the last one that went out; an
+        identical list is not sent again, because a client that already holds it learns
+        nothing and a slow reader would be made to hold the fast ones up (F5).  A socket
+        that has never seen a list gets one at connect, outside this path.
+        """
         payload = {"t": "list", "users": lobby.waiting_list()}
+        blob = json.dumps(payload, ensure_ascii=False)
+        if blob == last_broadcast["json"]:
+            return False
+        last_broadcast["json"] = blob
         for uid in lobby.connected_ids():                # a snapshot; sends may fail
             await _send(lobby.socket_of(uid), payload)
+        return True
+
+    def _ws_token(websocket: WebSocket, token: str) -> str:
+        """The bearer token for a websocket: the `Authorization` header FIRST (F2).
+
+        The native client now authenticates its two sockets with a request header, which
+        WinHTTP can set on the upgrade (`port/platform/online.c`, `ws_open`), because a
+        query string is copied verbatim into uvicorn's handshake log record and from there
+        into every log export and backup -- a reusable 30-day credential sitting somewhere
+        nobody thinks of as secret.  `?token=` is still accepted for one release so a client
+        that has not been repacked keeps working; it is the compatibility path on both ends
+        and the query string is redacted in the logs either way.
+        """
+        header = websocket.headers.get("authorization") or ""
+        if header.lower().startswith("bearer "):
+            return header.split(None, 1)[1].strip()
+        return token
 
     @app.websocket("/v1/lobby/ws")
     async def lobby_ws(websocket: WebSocket, token: str = "") -> None:
-        claims = read_token(settings.secret, token)
+        claims = read_token(settings.secret, _ws_token(websocket, token))
         user = store.user_by_id(int(claims["sub"])) if claims else None
         if user is None:
             await websocket.close(code=WS_POLICY_VIOLATION)
             return
         user_id, username = int(user["id"]), user["username"]
+        ip = _client_key(websocket, settings)
         await websocket.accept()
-        displaced = await lobby.attach(user_id, websocket)
+        try:
+            displaced = await lobby.attach(user_id, websocket)
+        except Refused as refused:               # F5: the lobby socket cap
+            log.event("lobby.refused", level="warn", user_id=user_id, reason=refused.reason)
+            await _send(websocket, {"t": "error", "msg": refused.reason})
+            await websocket.close(code=WS_TRY_AGAIN_LATER)
+            return
         if displaced is not None:
             await _send(displaced, {"t": "error", "msg": "this account opened another lobby "
                                                          "connection"})
@@ -329,6 +541,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             while True:
                 raw = await websocket.receive_text()
+                # F3. The application's own ceiling, under uvicorn's --ws-max-size: a text
+                # frame this large is not a lobby message whatever it contains, and 1009 is
+                # the code that says so.
+                if len(raw) > settings.max_lobby_message:
+                    log.event("lobby.oversize", level="warn", user_id=user_id, size=len(raw))
+                    await websocket.close(code=WS_MESSAGE_TOO_BIG)
+                    return
+                # F5. One bucket per account AND one per address.
+                if not _spend("lobby_ops", ["user:%d" % user_id, "ip:" + ip]):
+                    log.event("budget.lobby_ops", level="warn", user_id=user_id)
+                    await _send(websocket, {"t": "error",
+                                            "msg": "too many lobby messages; slow down"})
+                    await websocket.close(code=WS_TRY_AGAIN_LATER)
+                    return
                 try:
                     msg = json.loads(raw)
                     if not isinstance(msg, dict):
@@ -384,6 +610,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if them_w is None:
                 await _send(websocket, {"t": "error", "msg": "that player is not waiting"})
                 return
+            # F4. The invitation becomes SERVER STATE here, directed and with an expiry.
+            # Until this line the server forwarded the message and remembered nothing, so
+            # `accept` had nothing to check and any waiter could be matched without consent.
+            await lobby.offer_invite(user_id, target)
             log.event("lobby.invite", user_id=user_id, to=target)
             await _send(lobby.socket_of(target), {"t": "invite", "from": me_w.public()})
             return
@@ -392,6 +622,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(origin, int):
                 await _send(websocket, {"t": "error", "msg": "decline needs the inviter's id"})
                 return
+            # F4. A refused invitation is GONE: a later accept of it must not work.
+            await lobby.withdraw_invite(origin, user_id)
             log.event("lobby.decline", user_id=user_id, inviter=origin)
             await _send(lobby.socket_of(origin), {"t": "decline", "from": user_id})
             return
@@ -407,7 +639,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return
             inviter_pub, me_pub = inviter_w.public(), me_w.public()
             inviter_socket, my_socket = lobby.socket_of(origin), websocket
-            room = await lobby.match(origin, user_id)
+            # F4. `match` consumes the pending directed invitation inside the same lock it
+            # creates the room under, and returns None when there is none to consume -- so a
+            # bare accept, a replayed accept and a declined one are all the same refusal,
+            # and two accepts of one invitation cannot both win.
+            try:
+                room = await lobby.match(origin, user_id)
+            except Refused as refused:           # F5: the room cap
+                log.event("lobby.refused", level="warn", user_id=user_id,
+                          reason=refused.reason)
+                await _send(websocket, {"t": "error", "msg": refused.reason})
+                return
             if room is None:
                 await _send(websocket, {"t": "error", "msg": "that invite is no longer valid"})
                 return
@@ -428,20 +670,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/v1/relay/{room}")
     async def relay_ws(websocket: WebSocket, room: int, token: str = "") -> None:
-        claims = read_token(settings.secret, token)
+        claims = read_token(settings.secret, _ws_token(websocket, token))
         user = store.user_by_id(int(claims["sub"])) if claims else None
         if user is None:
             await websocket.close(code=WS_POLICY_VIOLATION)
             return
         user_id = int(user["id"])
+        ip = _client_key(websocket, settings)
         await websocket.accept()
         joined = await lobby.join_room(room, user_id, websocket)
         if joined is None:
             await _send(websocket, {"t": "error", "msg": "no such room, or you are not in it"})
             await websocket.close(code=WS_POLICY_VIOLATION)
             return
-        peer_id = joined.peer_of(user_id)
-        log.event("relay.open", room=room, user_id=user_id, peer=peer_id)
+        # F6. `generation` is this CONNECTION's right to write for its side of the room, and
+        # `displaced` is the socket it took that right from. The old one is told and closed
+        # rather than left running: before this it stayed an authorized writer for ever, so
+        # a stale client or a stolen token interleaved frames with its own replacement.
+        room_state, generation, displaced = joined
+        if displaced is not None and displaced is not websocket:
+            log.event("relay.replaced", level="warn", room=room, user_id=user_id)
+            await _send(displaced, {"t": "error", "msg": "this account opened another relay "
+                                                         "connection for this room"})
+            try:
+                await displaced.close(code=WS_POLICY_VIOLATION)
+            except Exception:
+                pass
+        peer_id = room_state.peer_of(user_id)
+        log.event("relay.open", room=room, user_id=user_id, peer=peer_id,
+                  generation=generation)
         frames = 0
         try:
             while True:
@@ -450,7 +707,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise WebSocketDisconnect(packet.get("code", 1000))
                 if packet.get("bytes") is not None:
                     payload = packet["bytes"]
-                    peer = joined.sockets.get(peer_id)
+                    # F3. online-spec.md's frame ceiling, enforced by the server as well as
+                    # by the client: the relay is opaque, and an opaque forwarder can still
+                    # count bytes without interpreting one.
+                    if len(payload) > settings.relay_frame_max:
+                        log.event("relay.oversize", level="warn", room=room, user_id=user_id,
+                                  size=len(payload))
+                        await websocket.close(code=WS_MESSAGE_TOO_BIG)
+                        return
+                    # F5. Frames and bytes, per account and per address.
+                    keys = ["user:%d" % user_id, "ip:" + ip]
+                    if not _spend("relay_ops", keys) \
+                            or not _spend("relay_bytes", keys, float(len(payload))):
+                        log.event("budget.relay", level="warn", room=room, user_id=user_id)
+                        await websocket.close(code=WS_TRY_AGAIN_LATER)
+                        return
+                    # F6. Asked for every frame, under the lobby's lock: a captured socket
+                    # reference is exactly what a superseded connection still holds.
+                    peer = await lobby.may_forward(room, user_id, generation)
+                    if peer is None and not room_state.current(user_id, generation):
+                        log.event("relay.superseded", level="warn", room=room,
+                                  user_id=user_id, generation=generation)
+                        await websocket.close(code=WS_POLICY_VIOLATION)
+                        return
                     if peer is not None:
                         try:
                             # Verbatim. The server never reads kind, port or length.
@@ -462,6 +741,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 text = packet.get("text")
                 if text is None:
                     continue
+                if len(text) > settings.max_lobby_message:
+                    log.event("relay.oversize", level="warn", room=room, user_id=user_id,
+                              size=len(text))
+                    await websocket.close(code=WS_MESSAGE_TOO_BIG)
+                    return
                 try:
                     msg = json.loads(text)
                 except Exception:

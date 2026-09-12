@@ -35,9 +35,22 @@ from app.savecheck import BANK_SIZE, BANK2_OFF, CHECKSUM_OFF, compute_checksum  
 class LiveServer:
     """A uvicorn instance on a loopback port, torn down at the end of the test."""
 
-    def __init__(self, app) -> None:
-        config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning",
-                                access_log=False)
+    def __init__(self, app, ws_max_size: int = 65536, access_log: bool = False,
+                 log_level: str = "warning") -> None:
+        # `ws_max_size` and `--ws-max-size` in the Dockerfile are the SAME number and have to
+        # stay that way: F3's protocol-layer ceiling is not tested at all if the fixture runs
+        # with uvicorn's 16 MiB default while the container runs with 64 KiB.
+        #
+        # `proxy_headers=False` is F1, and it was found by this fixture failing. uvicorn has
+        # its OWN `ProxyHeadersMiddleware`, ON BY DEFAULT, which rewrites `scope["client"]`
+        # from `X-Forwarded-For` whenever the peer is in `forwarded_allow_ips` (default
+        # `127.0.0.1`) -- so the application's careful decision about whose header to believe
+        # was being made on an address uvicorn had already replaced from the same header.
+        # The service decides this itself, in `main._client_key`, from `ACWW_TRUSTED_PROXIES`;
+        # the Dockerfile passes `--no-proxy-headers` for the same reason.
+        config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level=log_level,
+                                access_log=access_log, ws_max_size=ws_max_size,
+                                proxy_headers=False)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
         self._thread.start()
@@ -62,7 +75,8 @@ class LiveServer:
         self._thread.join(timeout=30)
 
 
-def make_server(tmp_path: Path, **overrides) -> LiveServer:
+def make_server(tmp_path: Path, ws_max_size: int = 65536, access_log: bool = False,
+                log_level: str = "warning", **overrides) -> LiveServer:
     kwargs = dict(
         data_dir=tmp_path,
         secret="test-secret-0123456789abcdef0123456789abcdef",  # >= 32 bytes: PyJWT warns below that
@@ -73,7 +87,8 @@ def make_server(tmp_path: Path, **overrides) -> LiveServer:
     )
     kwargs.update(overrides)
     (tmp_path / "saves").mkdir(parents=True, exist_ok=True)
-    return LiveServer(create_app(Settings(**kwargs)))
+    return LiveServer(create_app(Settings(**kwargs)), ws_max_size=ws_max_size,
+                      access_log=access_log, log_level=log_level)
 
 
 @pytest.fixture
@@ -95,6 +110,8 @@ def server_factory(tmp_path):
         s = make_server(d, **overrides)
         made.append(s)
         return s
+
+    _make.tmp_path = tmp_path                       # type: ignore[attr-defined]
 
     try:
         yield _make

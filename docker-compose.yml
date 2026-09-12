@@ -11,9 +11,13 @@ services:
     image: acww-online:dev
     restart: unless-stopped
     ports:
-      # Host 8080 -> container 8080. Put the NAS reverse proxy in front of this and do
-      # NOT open this port on the router: the service speaks plain HTTP.
-      - "8080:8080"
+      # Host 127.0.0.1:8080 -> container 8080. Bound to LOOPBACK (SERVERFIX108): the
+      # supported deployment reaches this through the NAS's own reverse proxy, which runs
+      # on the same host, and `8080:8080` published the plaintext port on every host
+      # interface -- reachable from the LAN even when the router forwards nothing. An
+      # operator whose proxy is in another container needs the docker network instead of a
+      # wider bind. And still do NOT open this port on the router: it is plain HTTP.
+      - "127.0.0.1:8080:8080"
     volumes:
       # The accounts, the SQLite file and every save version. This directory IS the
       # backup. `chown -R 10001:10001 ./data` once, because the container is non-root.
@@ -21,7 +25,14 @@ services:
     environment:
       ACWW_SERVER_SECRET: "${ACWW_SERVER_SECRET:-}"
       ACWW_ALLOW_REGISTER: "1"      # set to 0 once the household's accounts exist
-      ACWW_TRUST_PROXY: "1"         # the rate limiter reads X-Forwarded-For from the NAS proxy
+      # SERVERFIX108 / F1. The addresses whose `X-Forwarded-For` is believed -- and ONLY
+      # those. `ACWW_TRUST_PROXY: "1"` used to be here and was not safe on its own: it made
+      # the limiter read the header's FIRST element, which the documented appending nginx
+      # line leaves attacker-chosen, so anyone could mint a fresh login budget per invented
+      # prefix. 127.0.0.1 is the NAS's own reverse proxy on the host network; a proxy in
+      # another container reaches this over the docker bridge instead, which is the
+      # 172.16.0.0/12 row -- delete whichever of the two your deployment does not use.
+      ACWW_TRUSTED_PROXIES: "127.0.0.1, 172.16.0.0/12"
     healthcheck:
       # python is already in the image; no curl is installed and none is needed.
       test: ["CMD", "python", "-c",

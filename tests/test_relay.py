@@ -40,6 +40,13 @@ def matched(server):
     a.send(t="wait", mode="host", town_name="Hanabi")
     b.send(t="wait", mode="guest", town_name="Kirie")
     a.expect_list(2)
+    # SERVERFIX108 / F4. This fixture used to accept an invitation that was never sent, and
+    # that was not a shortcut -- it was the hole: before the fix the server held no record of
+    # an invitation, so `accept` could only check that both parties were waiting and anyone
+    # in the list could match with anyone else without their consent. The invite is now part
+    # of the setup because it is now part of the protocol.
+    a.send(t="invite", to=b_id)
+    b.expect("invite")
     b.send(t="accept", **{"from": a_id})
     room = a.expect("matched")["room"]
     assert b.expect("matched")["room"] == room

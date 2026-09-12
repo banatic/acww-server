@@ -35,4 +35,20 @@ EXPOSE 8080
 
 # TLS, the public hostname and the certificate are the NAS reverse proxy's job; this
 # speaks plain HTTP on one port and nothing else.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+#
+# SERVERFIX108 / F3.  `--ws-max-size` is uvicorn's OWN ceiling and it defaults to 16 MiB:
+# a frame is refused at the protocol layer, before the application sees a byte, so the
+# application's own caps (a lobby message, a 4,096-byte relay frame) are the second gate
+# rather than the first.  64 KiB is sixteen times the relay's ceiling, which leaves room
+# for a future frame contract without leaving room for a memory attack.
+#
+# ONE WORKER, deliberately and not by omission: the save store's compare-and-swap is a lock
+# inside one process, and a second worker would make two writers believe they both won.
+# `--no-proxy-headers` is F1 and it is NOT the same switch as ACWW_TRUSTED_PROXIES.
+# uvicorn's own ProxyHeadersMiddleware is on by default and rewrites the client address from
+# `X-Forwarded-For` whenever the peer is in `--forwarded-allow-ips` -- so the application
+# would be deciding whose header to believe using an address taken from that header. The
+# service makes that decision itself, from ACWW_TRUSTED_PROXIES, in app/main.py's
+# `_client_key`; there is exactly one place it is made and this is how it stays that way.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--workers", "1", "--ws-max-size", "65536", "--no-proxy-headers"]

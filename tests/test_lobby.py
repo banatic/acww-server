@@ -156,6 +156,8 @@ def test_the_inviter_is_the_parent_when_both_say_the_same_mode(two):
     a.send(t="wait", mode="guest", town_name="Hanabi")
     b.send(t="wait", mode="guest", town_name="Kirie")
     a.expect_list(2)
+    a.send(t="invite", to=b_id)                  # F4: accept consumes a real invitation
+    b.expect("invite")
     b.send(t="accept", **{"from": a_id})
     assert a.expect("matched")["role"] == "parent"
     assert b.expect("matched")["role"] == "child"

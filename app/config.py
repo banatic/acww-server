@@ -10,6 +10,14 @@ bytes on first run and persist them as `<data>/secret.key`, so restarting the co
 does not invalidate every stored token -- and we say so in the log, once, loudly, because
 a secret the operator did not choose is a fact they need to know before they take a
 backup.  The file is written 0600 and its CONTENT is never logged.
+
+SERVERFIX108, THE BOUNDS.  Everything below `trusted_proxies` is a CEILING rather than a
+feature: a size checked before an allocation, a budget refilled at a rate the game's own
+traffic never reaches, a cap on how many sockets and rooms one process will hold.  They are
+environment variables for the same reason the rest are -- the operator's only knob is a
+compose file -- but the defaults are the supported deployment and an operator who has to
+change one should say why in their own notes.  `ACWW_TRUSTED_PROXIES` defaults to EMPTY,
+which means `X-Forwarded-For` is not read at all; see `_client_key` in app/main.py.
 """
 
 from __future__ import annotations
@@ -36,11 +44,31 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_list(name: str) -> tuple[str, ...]:
+    """A comma- or space-separated list of addresses/networks, in order, no duplicates."""
+    raw = os.environ.get(name) or ""
+    out: list[str] = []
+    for piece in raw.replace(",", " ").split():
+        if piece not in out:
+            out.append(piece)
+    return tuple(out)
 
 
 @dataclass
@@ -53,7 +81,40 @@ class Settings:
     auth_rate_limit: int = 10          # attempts ...
     auth_rate_window: int = 60         # ... per this many seconds, per IP
     save_history: int = 20             # versions kept per user
-    trust_proxy: bool = False          # read X-Forwarded-For for the rate limiter's key
+    trust_proxy: bool = False          # LEGACY: on its own it no longer trusts anything
+
+    # F1. The ONLY addresses whose `X-Forwarded-For` is read, as literal addresses or CIDR
+    # networks.  Empty (the default) means the header is ignored and the transport peer is
+    # the rate limiter's key, so a directly reachable server cannot be talked around.
+    trusted_proxies: tuple[str, ...] = ()
+    limiter_max_keys: int = 4096       # the limiter's map is bounded and evicts the oldest
+
+    # F3. Sizes checked BEFORE an allocation or a hash.
+    max_auth_body: int = 4096          # bytes of JSON a login/register may send
+    max_username: int = 24             # matches USERNAME_RE, checked before hashing
+    max_password: int = 256            # argon2 on a megabyte is the denial of service
+    max_lobby_message: int = 8192      # one lobby JSON text frame
+    ws_max_message: int = 65536        # uvicorn's --ws-max-size, the protocol ceiling
+    relay_frame_max: int = 4096        # online-spec.md's frame ceiling, enforced here too
+
+    # F4. A directed invitation is pending for this long and no longer.
+    invite_ttl: float = 60.0
+
+    # F5. Token buckets: `burst` is the bucket, `per_sec` the refill.  The defaults are far
+    # above what the game generates (a save is a handful of PUTs a day; the relay carries at
+    # most one WM frame per side per 1/60 s) and far below what a flood needs.
+    http_ops_burst: int = 120
+    http_ops_per_sec: float = 10.0
+    http_bytes_burst: int = 16 * 1024 * 1024
+    http_bytes_per_sec: float = 2.0 * 1024 * 1024
+    lobby_ops_burst: int = 60
+    lobby_ops_per_sec: float = 10.0
+    relay_ops_burst: int = 1200
+    relay_ops_per_sec: float = 300.0
+    relay_bytes_burst: int = 4 * 1024 * 1024
+    relay_bytes_per_sec: float = 512.0 * 1024
+    max_lobby_sockets: int = 32        # sockets this process will hold at once
+    max_rooms: int = 16                # live relay rooms at once
 
     @property
     def db_path(self) -> Path:
@@ -78,6 +139,26 @@ class Settings:
             auth_rate_window=_env_int("ACWW_AUTH_RATE_WINDOW", 60),
             save_history=_env_int("ACWW_SAVE_HISTORY", 20),
             trust_proxy=_env_bool("ACWW_TRUST_PROXY", False),
+            trusted_proxies=_env_list("ACWW_TRUSTED_PROXIES"),
+            limiter_max_keys=_env_int("ACWW_LIMITER_MAX_KEYS", 4096),
+            max_auth_body=_env_int("ACWW_MAX_AUTH_BODY", 4096),
+            max_password=_env_int("ACWW_MAX_PASSWORD", 256),
+            max_lobby_message=_env_int("ACWW_MAX_LOBBY_MESSAGE", 8192),
+            ws_max_message=_env_int("ACWW_WS_MAX_MESSAGE", 65536),
+            relay_frame_max=_env_int("ACWW_RELAY_FRAME_MAX", 4096),
+            invite_ttl=_env_float("ACWW_INVITE_TTL", 60.0),
+            http_ops_burst=_env_int("ACWW_HTTP_OPS_BURST", 120),
+            http_ops_per_sec=_env_float("ACWW_HTTP_OPS_PER_SEC", 10.0),
+            http_bytes_burst=_env_int("ACWW_HTTP_BYTES_BURST", 16 * 1024 * 1024),
+            http_bytes_per_sec=_env_float("ACWW_HTTP_BYTES_PER_SEC", 2.0 * 1024 * 1024),
+            lobby_ops_burst=_env_int("ACWW_LOBBY_OPS_BURST", 60),
+            lobby_ops_per_sec=_env_float("ACWW_LOBBY_OPS_PER_SEC", 10.0),
+            relay_ops_burst=_env_int("ACWW_RELAY_OPS_BURST", 1200),
+            relay_ops_per_sec=_env_float("ACWW_RELAY_OPS_PER_SEC", 300.0),
+            relay_bytes_burst=_env_int("ACWW_RELAY_BYTES_BURST", 4 * 1024 * 1024),
+            relay_bytes_per_sec=_env_float("ACWW_RELAY_BYTES_PER_SEC", 512.0 * 1024),
+            max_lobby_sockets=_env_int("ACWW_MAX_LOBBY_SOCKETS", 32),
+            max_rooms=_env_int("ACWW_MAX_ROOMS", 16),
         )
 
 

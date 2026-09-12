@@ -2,8 +2,9 @@
 
 The contract is `docs/kb/hybrid/online-spec.md`. This file is that page's endpoint table
 plus, at the top, every place the implementation had to decide something the page left
-open. The same list is mirrored into the spec under "Deviations and resolutions,
-SERVER79, 2026-09-11" -- the two move together or neither is trustworthy.
+open. **That list is now HERE ONLY** -- the spec used to carry a verbatim copy and points at
+this one instead (serverfix108), because two copies of a contract is one copy plus a thing
+that goes stale.
 
 ## Deviations and resolutions (SERVER79, 2026-09-11)
 
@@ -45,10 +46,11 @@ decisions, not departures, and the client must follow them.
     between `matched` and the relay connect does not hold its id forever.
 12. **Environment variables beyond `ACWW_SERVER_SECRET` and `ACWW_ALLOW_REGISTER`**, each
     defaulting to the spec's own value: `ACWW_DATA_DIR` (`/data`), `ACWW_TOKEN_DAYS` (30),
-    `ACWW_AUTH_RATE_LIMIT` (10), `ACWW_AUTH_RATE_WINDOW` (60), `ACWW_SAVE_HISTORY` (20),
-    `ACWW_TRUST_PROXY` (0). They exist because the tests need several isolated servers in
-    one process, and because the rate limiter behind a reverse proxy sees only the proxy
-    unless it is told the proxy is there.
+    `ACWW_AUTH_RATE_LIMIT` (10), `ACWW_AUTH_RATE_WINDOW` (60), `ACWW_SAVE_HISTORY` (20).
+    They exist because the tests need several isolated servers in one process. The bounds,
+    budgets and caps SERVERFIX108 added are variables of the same kind and are listed in
+    that section below; `ACWW_TRUST_PROXY` survives only as a legacy name that on its own
+    now trusts nothing -- `ACWW_TRUSTED_PROXIES` is the one that reads a forwarded header.
 
 ## Transport and auth
 
@@ -56,6 +58,8 @@ HTTP/1.1 + JSON on one port (default 8080; TLS is the NAS reverse proxy's job). 
 token from login (JWT, HS256, secret from `ACWW_SERVER_SECRET`, 30-day expiry). Registration
 open when `ACWW_ALLOW_REGISTER=1`. Passwords hashed with argon2id (fallback bcrypt). Rate
 limit 10 auth attempts / minute / IP. All binary bodies are `application/octet-stream`.
+**Both websockets authenticate with `Authorization: Bearer` like every other endpoint**; the
+`?token=` query form is read only as a fallback and is deprecated (SERVERFIX108).
 
 ## Endpoints
 
@@ -69,8 +73,8 @@ limit 10 auth attempts / minute / IP. All binary bodies are `application/octet-s
 | `GET /v1/save/history` | bearer | `[{version, sha256, size, updated_utc}]`, newest first, the last 20 |
 | `GET /v1/save/{version}` | bearer | that version's bytes + `ETag`, `X-Save-Sha256`; 404 once it is pruned |
 | `GET /v1/lobby` | bearer | `[{user_id, username, town_name, mode, since_utc}]` -- everyone waiting |
-| `WS /v1/lobby/ws?token=` | client sends `{"t":"wait","mode":"host"\|"guest","town_name":...}` / `{"t":"leave"}` / `{"t":"invite","to":id}` / `{"t":"accept","from":id}` / `{"t":"decline","from":id}` / `{"t":"ping"}` | server pushes `{"t":"list","users":[...]}` on connect and on every change, `{"t":"invite","from":{...}}`, `{"t":"decline","from":id}`, `{"t":"matched","room":id,"peer":{...},"role":"parent"\|"child"}` to both, `{"t":"pong"}`, `{"t":"error","msg":...}` |
-| `WS /v1/relay/{room}?token=` | only the two matched users | binary frames forwarded verbatim to the other peer; `{"t":"ping"}` -> `{"t":"pong"}`; the room closes when either side leaves and the survivor gets `{"t":"peer_left"}` |
+| `WS /v1/lobby/ws` (bearer header; `?token=` deprecated) | client sends `{"t":"wait","mode":"host"\|"guest","town_name":...}` / `{"t":"leave"}` / `{"t":"invite","to":id}` / `{"t":"accept","from":id}` / `{"t":"decline","from":id}` / `{"t":"ping"}` | server pushes `{"t":"list","users":[...]}` on connect and on every change, `{"t":"invite","from":{...}}`, `{"t":"decline","from":id}`, `{"t":"matched","room":id,"peer":{...},"role":"parent"\|"child"}` to both, `{"t":"pong"}`, `{"t":"error","msg":...}` |
+| `WS /v1/relay/{room}` (bearer header; `?token=` deprecated) | only the two matched users | binary frames forwarded verbatim to the other peer; `{"t":"ping"}` -> `{"t":"pong"}`; the room closes when either side leaves and the survivor gets `{"t":"peer_left"}` |
 | `GET /v1/health` | -- | `{ok: true, version, users, waiting, rooms}` |
 
 ## The relay frame contract
@@ -113,3 +117,43 @@ contract that made the above debuggable -- `auth.login`, `save.put` (with `if_ma
 and `child`) and `relay.close` (with `frames_forwarded`). They go to **stdout**; uvicorn's
 access lines go to **stderr**, and `docker logs` returns the two as separate blocks rather
 than interleaved.
+
+## SERVERFIX108 -- the security review's seven findings (2026-09-12)
+
+`scratchpad/handoff/server-audit-1` reviewed this service and found seven. All seven are fixed
+and each has its own regression test file under `server/tests/`; `docs/kb/hybrid/online-spec.md`
+carries the same list as contract. Nothing in the endpoint table above changed except the two
+websocket rows and the three new refusal codes named below.
+
+| # | what was wrong | what it is now | test file |
+|---|---|---|---|
+| F1 | `ACWW_TRUST_PROXY=1` read `X-Forwarded-For`'s FIRST element, which the documented appending nginx line leaves attacker-chosen -- a forged prefix bought a fresh unauthenticated login budget, and repeating somebody else's spent theirs. The limiter's key map also grew one bucket per invented prefix, for ever | the transport peer must itself be in `ACWW_TRUSTED_PROXIES` (**empty by default**, so the header does nothing out of the box; literal addresses or CIDR, and an unparseable entry matches nothing), and then the chain is read from the RIGHT -- the last hop that is not itself a trusted proxy. uvicorn's own `ProxyHeadersMiddleware` is turned OFF (`--no-proxy-headers`) so the decision is made in one place. The limiter map is bounded (`ACWW_LIMITER_MAX_KEYS`, 4,096) and evicts least-recently-used | `test_proxy_trust.py` |
+| F2 | both websockets took their JWT in the query string, and uvicorn logs a handshake as `"WebSocket <path-with-query>" [accepted]` at INFO -- a reusable 30-day credential in stdout on every lobby and relay connect, outside this service's own field scrubbing and outside `--no-access-log` | `Authorization: Bearer` on the upgrade, read first; `?token=` still accepted for one release as the compatibility path (the client puts it back only behind `ACWW_ONLINE_WS_QUERY_TOKEN=1` / `ws_query_token=1`, and says so in its log). `app/logging_.py` also installs a filter on uvicorn's own loggers that rewrites every query string to `?<redacted>` | `test_ws_auth_logging.py` |
+| F3 | sizes were checked after the allocation they would pay for: an unauthenticated login buffered and parsed a body of any size and then hashed a password of any length with argon2id; `PUT /v1/save` buffered the whole upload before asking whether it was 262,144 bytes; a websocket message had no application ceiling (uvicorn's default is 16 MiB) and the relay had no frame cap at all -- an 8,193-byte message reached the peer unchanged | `ACWW_MAX_AUTH_BODY` (4,096) refused from `Content-Length` and again while streaming; username/password bounded at 24 / 256 bytes before hashing; the save body streamed and abandoned above 262,144 (**413**); `ACWW_MAX_LOBBY_MESSAGE` (8,192) and `ACWW_RELAY_FRAME_MAX` (4,096) close **1009**; `--ws-max-size 65536` refuses at the protocol layer first | `test_bounds.py` |
+| F4 | `accept` checked only that both parties were waiting -- no invitation existed in server state -- so any account could read a victim's id out of the list and force a match, taking them out of the list they were choosing from | `invite` records a DIRECTED pending invitation with `ACWW_INVITE_TTL` (60 s); `accept` consumes exactly that one inside the lock that creates the room; `decline`, `leave` and a lost socket clear every invitation the account is either end of. A bare, replayed, wrong-direction, declined or expired accept is all one refusal | `test_invites.py` |
+| F5 | no message, transfer or room budget: repeated `wait` with unchanged state re-serialized and re-broadcast the whole list to every socket; invite/decline/ping/relay/save had no rate; there was no lobby-socket or active-room quota | token buckets per account AND per client address over HTTP operations and bytes, lobby messages, relay frames and bytes (**429** on HTTP, close **1013** on a socket); an unchanged list is not re-broadcast; `ACWW_MAX_LOBBY_SOCKETS` (32) and `ACWW_MAX_ROOMS` (16). Every default is far above the game's own traffic and there is a test that says so | `test_budgets.py` |
+| F6 | a second relay socket for the same side of a room overwrote the map entry and left the first connection running as an authorized writer -- a stale client or a stolen token interleaved frames with its replacement | `join_room` hands the connection a GENERATION and returns the socket it displaced; the displaced one is told `{"t":"error"}` and closed **1008**, and the generation is checked under the lock before every forward. A stale disconnect cannot free the room its replacement is in | `test_relay_sessions.py` |
+| F7 | an `If-Match` the parser could not read -- a tag list like `"0", "999"`, a malformed tag, an empty header -- returned the same `None` as "no header", so an unsupported precondition silently became an unconditional write and could overwrite a newer save | absent, invalid and `*` are three different answers; invalid is **428** and is decided before the body is read. `"7"`, `W/"7"`, `7` and `*` keep their exact old behaviour | `test_if_match.py` |
+
+**Environment added** (all optional, all defaulting to the values above):
+`ACWW_TRUSTED_PROXIES`, `ACWW_LIMITER_MAX_KEYS`, `ACWW_MAX_AUTH_BODY`, `ACWW_MAX_PASSWORD`,
+`ACWW_MAX_LOBBY_MESSAGE`, `ACWW_WS_MAX_MESSAGE`, `ACWW_RELAY_FRAME_MAX`, `ACWW_INVITE_TTL`,
+`ACWW_HTTP_OPS_BURST` / `_PER_SEC`, `ACWW_HTTP_BYTES_BURST` / `_PER_SEC`,
+`ACWW_LOBBY_OPS_BURST` / `_PER_SEC`, `ACWW_RELAY_OPS_BURST` / `_PER_SEC`,
+`ACWW_RELAY_BYTES_BURST` / `_PER_SEC`, `ACWW_MAX_LOBBY_SOCKETS`, `ACWW_MAX_ROOMS`.
+
+**Still true, and still the operator's job.** One worker only: the save store's
+compare-and-swap is a lock inside one process, so `--workers 1` is in the CMD and a second
+replica would make two writers believe they both won. The image still lacks a read-only
+rootfs, dropped capabilities, `no-new-privileges` and resource limits; the compose file still
+publishes `8080` on every host interface rather than `127.0.0.1`; a weak `ACWW_SERVER_SECRET`
+is still accepted at startup; and a password reset still leaves existing tokens valid, so a
+suspected stolen token means rotating the signing key. Those are deployment findings from the
+same review that this unit did not change.
+
+**Confirmed against the real client** (2026-09-12): the image rebuilt and
+`port/tools/test_online_integration.py`'s seven steps run end to end against it with a freshly
+packed `dist/acww.exe` -- register, login, save round trip with `If-Match`, the 412, offline,
+two processes matched and relaying in the lobby, and TLS through nginx. The container's whole
+log contains **zero** occurrences of `token=`, and the handshake records read
+`"WebSocket /v1/lobby/ws" [accepted]` with no query string at all.
