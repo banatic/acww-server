@@ -22,6 +22,8 @@ def test_health_needs_no_token(server):
     assert body["ok"] is True
     assert body["users"] == 0 and body["waiting"] == 0 and body["rooms"] == 0
     assert "version" in body
+    assert "commit" in body
+    assert r.headers["cache-control"] == "no-store"
 
 
 def test_register_then_me(server):

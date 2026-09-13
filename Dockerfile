@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir -r /srv/requirements.txt
 
 COPY app /srv/app
 
+# post-commit writes app/build_commit.txt on the source machine. COPY above preserves
+# it for NAS builds without Git or build arguments. Missing metadata stays unknown.
+
 # Non-root.  The uid is FIXED at 10001 rather than left to the distro, because the data
 # volume's ownership on the NAS has to match it and an operator cannot chown to a number
 # that moves between rebuilds.  /data is created and handed over here so that a docker

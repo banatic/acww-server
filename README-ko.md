@@ -83,11 +83,24 @@ PC로 포팅한 《동물의 숲 - 튀어나와요 동물의 숲》(한국판 AD
 
 ```
 curl https://acww.내도메인.kr/v1/health
-{"ok":true,"version":"1.0.0","users":2,"waiting":0,"rooms":0}
+{"ok":true,"version":"1.0.0","commit":"<40자리 커밋 해시>","users":2,"waiting":0,"rooms":0}
 ```
 
 `users`는 계정 수, `waiting`은 지금 로비에서 기다리는 사람, `rooms`는 연결된 쌍의 수입니다.
 Container Manager의 상태 표시(healthcheck)도 30초마다 같은 주소를 확인합니다.
+
+`commit`은 빌드에 포함된 소스의 커밋입니다. PC의 post-commit 훅이
+`server/app/build_commit.txt`를 자동 생성하며, NAS에는 **이 파일까지 포함해 server 폴더를
+복사**하고 평소처럼 다시 빌드하면 됩니다. 빌드 인자나 NAS의 Git 설치는 필요 없습니다.
+브라우저에서 https://acww.moominda.synology.me/v1/health 를 열어 PC의 `git rev-parse HEAD`와
+비교하세요. 응답에는 캐시 방지를 위한 `Cache-Control: no-store`가 포함됩니다.
+
+새 체크아웃에서는 `git config core.hooksPath .githooks`로 훅을 활성화하세요.
+필요하면 저장소 루트에서 `python tools/stamp_server_commit.py`로 다시 생성할 수 있습니다.
+이 파일은 자기 커밋의 해시를 담으므로 Git 추적에서 제외합니다. 따라서 Git clone/archive로만
+전달하면 포함되지 않습니다. 파일이 없거나 잘못된 값이면 `commit`은 `unknown`입니다.
+생성 시 서버에 미커밋 변경이 있어도 `unknown`으로 기록합니다. 커밋 후 서버 코드를 추가로
+수정했다면 복사 전에 다시 생성하세요. 실행 환경변수로 커밋 표시를 덮어쓸 수는 없습니다.
 
 ## 비밀번호를 잊었을 때
 

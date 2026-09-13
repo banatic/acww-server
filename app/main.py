@@ -24,6 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import logging_ as log
 from .config import SERVICE_VERSION, Settings
+from .buildinfo import build_commit
 from .lobby import LobbyState, Refused, RelayLeaveResult
 from .savecheck import FLASH_SIZE as SAVE_BYTES
 from .savecheck import SaveRejected, sha256_hex, validate_card_image
@@ -954,8 +955,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health() -> JSONResponse:
         waiting, rooms = lobby.counts()
         return JSONResponse({"ok": True, "version": SERVICE_VERSION,
+                             "commit": build_commit(),
                              "users": store.user_count(),
-                             "waiting": waiting, "rooms": rooms})
+                             "waiting": waiting, "rooms": rooms},
+                            headers={"Cache-Control": "no-store"})
 
     return app
 
