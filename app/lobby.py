@@ -80,15 +80,19 @@ class Waiter:
     mode: str                  # "host" | "guest"
     since_utc: str
     socket: Any = None
+    public_open: bool = False
 
     def public(self) -> dict:
-        return {
+        result = {
             "user_id": self.user_id,
             "username": self.username,
             "town_name": self.town_name,
             "mode": self.mode,
             "since_utc": self.since_utc,
         }
+        if self.public_open:
+            result["open"] = True
+        return result
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,16 @@ class CancelResult:
     notices: tuple[CancelNotice, ...] = ()
 
 
+@dataclass(frozen=True)
+class RelayLeaveResult:
+    """Sockets affected when one authenticated relay generation closes."""
+
+    room_closed: bool
+    aid: int
+    notify_sockets: tuple[Any, ...] = ()
+    close_sockets: tuple[Any, ...] = ()
+
+
 @dataclass
 class LobbySession:
     """One lobby socket generation and its ordered outbound event queue."""
@@ -146,21 +160,84 @@ class LobbySession:
 class Room:
     room_id: int
     parent_id: int
-    child_id: int
     created_mono: float
+    children: dict[int, int] = field(default_factory=dict)  # user id -> AID 1..3
     sockets: dict[int, Any] = field(default_factory=dict)
     # F6. The generation the CURRENT socket of each side was registered with. A receive loop
     # holding an older one is a superseded connection and may not forward.
     gens: dict[int, int] = field(default_factory=dict)
-    invite_id: int | None = None
+    invite_ids: dict[int, int] = field(default_factory=dict)
     parent_public: dict | None = None
-    child_public: dict | None = None
+    children_public: dict[int, dict] = field(default_factory=dict)
+    # Lobby generations that authorized this match.  They distinguish a repeated command
+    # on the same session from a fresh matchmaking session after an abandoned pre-relay room.
+    lobby_gens: dict[int, int] = field(default_factory=dict)
+    public_open: bool = False
 
-    def members(self) -> tuple[int, int]:
-        return (self.parent_id, self.child_id)
+    @property
+    def child_id(self) -> int:
+        """The first child, retained for the legacy two-player API and tests."""
+        return next(iter(self.children))
+
+    @property
+    def invite_id(self) -> int | None:
+        return self.invite_ids.get(self.child_id) if self.children else None
+
+    @property
+    def child_public(self) -> dict | None:
+        return self.children_public.get(self.child_id) if self.children else None
+
+    def members(self) -> tuple[int, ...]:
+        return (self.parent_id, *self.children.keys())
+
+    def aid_of(self, user_id: int) -> int | None:
+        if user_id == self.parent_id:
+            return 0
+        return self.children.get(user_id)
+
+    def member_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        parent = dict(self.parent_public or {"user_id": self.parent_id})
+        parent["aid"] = 0
+        rows.append(parent)
+        for child_id, aid in sorted(self.children.items(), key=lambda item: item[1]):
+            child = dict(self.children_public.get(child_id) or {"user_id": child_id})
+            child["aid"] = aid
+            rows.append(child)
+        return rows
+
+    def add_child(self, user_id: int, public: dict, invite_id: int) -> int:
+        if user_id in self.children:
+            return self.children[user_id]
+        used = set(self.children.values())
+        aid = next((candidate for candidate in range(1, 4) if candidate not in used), 0)
+        if not aid:
+            raise Refused("that town already has four players")
+        self.children[user_id] = aid
+        self.children_public[user_id] = public
+        self.invite_ids[user_id] = invite_id
+        return aid
+
+    def remove_child(self, user_id: int) -> int | None:
+        aid = self.children.pop(user_id, None)
+        self.children_public.pop(user_id, None)
+        self.invite_ids.pop(user_id, None)
+        self.sockets.pop(user_id, None)
+        self.gens.pop(user_id, None)
+        return aid
+
+    def is_full(self) -> bool:
+        return len(self.children) >= 3
 
     def peer_of(self, user_id: int) -> int:
         return self.child_id if user_id == self.parent_id else self.parent_id
+
+    def forward_targets(self, user_id: int) -> tuple[Any, ...]:
+        if user_id == self.parent_id:
+            return tuple(socket for child_id, socket in self.sockets.items()
+                         if child_id in self.children)
+        parent = self.sockets.get(self.parent_id)
+        return (parent,) if parent is not None else ()
 
     def current(self, user_id: int, generation: int) -> bool:
         return self.gens.get(user_id) == generation
@@ -186,10 +263,23 @@ class LobbyState:
     # ------------------------------------------------------------- accounting
 
     def waiting_list(self) -> list[dict]:
-        return [w.public() for w in sorted(self._waiters.values(), key=lambda w: w.since_utc)]
+        result: list[dict] = []
+        for waiter in sorted(self._waiters.values(), key=lambda w: w.since_utc):
+            row = waiter.public()
+            if waiter.public_open:
+                room = self._active_room_locked(waiter.user_id)
+                players = len(room.members()) if room is not None else 1
+                if room is not None and room.is_full():
+                    continue
+                row["players"] = players
+                row["capacity"] = 4
+                if room is not None:
+                    row["room"] = room.room_id
+            result.append(row)
+        return result
 
     def counts(self) -> tuple[int, int]:
-        return len(self._waiters), len(self._rooms)
+        return len(self.waiting_list()), len(self._rooms)
 
     def connected_ids(self) -> list[int]:
         """Everyone holding a lobby socket right now -- the broadcast's audience."""
@@ -265,16 +355,29 @@ class LobbyState:
             session.outbox.clear()
             session.wake.set()
             result = self._cancel_locked(user_id, remove_wait=True)
+            # A matched room outlives its lobby sockets.  The game closes the lobby channel
+            # before opening the binary relay, so reaping an empty pre-relay room here races
+            # the normal hand-off and makes the relay answer 1008.  The room idle sweep owns
+            # cleanup for a match whose game never reaches the relay.
             return result.changed, result.notices
 
     async def wait(self, user_id: int, username: str, town_name: str, mode: str,
-                   socket: Any, generation: int | None = None) -> bool:
+                   socket: Any, generation: int | None = None,
+                   public_open: bool = False) -> bool:
         async with self._lock:
             if not self._mutation_owner_locked(user_id, socket, generation):
                 return False
+            # A fresh private matchmaking request supersedes an earlier match that never
+            # opened a relay.  Do this on the explicit new `wait`, not on lobby disconnect:
+            # closing the lobby socket is the normal game-to-relay hand-off.
+            old_room = self._active_room_locked(user_id)
+            if (old_room is not None and not old_room.public_open and not old_room.sockets
+                    and old_room.lobby_gens.get(user_id) != generation):
+                self._rooms.pop(old_room.room_id, None)
             existing = self._waiters.get(user_id)
             since = existing.since_utc if existing else _utc()
-            self._waiters[user_id] = Waiter(user_id, username, town_name, mode, since, socket)
+            self._waiters[user_id] = Waiter(user_id, username, town_name, mode, since, socket,
+                                            public_open and mode == "host")
             return True
 
     async def leave(self, user_id: int) -> bool:
@@ -382,8 +485,12 @@ class LobbyState:
             target = self._waiters.get(target_id)
             if inviter is None or target is None:
                 return None
-            invitation = Invitation(inviter_id, target_id, next(self._invite_ids),
-                                    now + self.invite_ttl)
+            # A public host has already authorized every visitor by opening the gate.  Its
+            # pending requests may wait through another player's multi-minute arrival; keep
+            # those requests until accept, close, or disconnect.  Private directed invites
+            # retain the short consent expiry from F4.
+            deadline = float("inf") if target.public_open else now + self.invite_ttl
+            invitation = Invitation(inviter_id, target_id, next(self._invite_ids), deadline)
             self._invites[(inviter_id, target_id)] = invitation
             inviter_public, target_public = inviter.public(), target.public()
             self._queue_session_locked(
@@ -454,35 +561,89 @@ class LobbyState:
             b = self._waiters.get(accepter_id)
             if a is None or b is None:
                 return None
-            self._sweep_locked()
-            if len(self._rooms) >= self.max_rooms:
-                raise Refused("this server is holding as many relay rooms as it will (%d); "
-                              "try again when a visit ends" % self.max_rooms)
-            del self._invites[(inviter_id, accepter_id)]
-            self._forget_invites_locked(inviter_id)
-            self._forget_invites_locked(accepter_id)
             if a.mode != b.mode:
                 parent, child = (a, b) if a.mode == "host" else (b, a)
             else:
                 parent, child = a, b          # the invite is the thing that happened
-            room = Room(next(self._room_ids), parent.user_id, child.user_id, now,
-                        invite_id=invitation.invite_id,
-                        parent_public=parent.public(), child_public=child.public())
-            self._rooms[room.room_id] = room
-            self._waiters.pop(inviter_id, None)
-            self._waiters.pop(accepter_id, None)
-            self._queue_session_locked(
-                self._sessions.get(parent.user_id),
-                {"t": "matched", "room": room.room_id,
-                 "peer": room.child_public, "role": "parent",
-                 "invite_id": room.invite_id},
-            )
+            self._sweep_locked()
+            child_room = self._active_room_locked(child.user_id)
+            room = self._active_room_locked(parent.user_id)
+            if child_room is not None:
+                return None
+            if room is not None and (room.parent_id != parent.user_id or not room.public_open):
+                raise Refused("that player is already in another room")
+            if room is None and len(self._rooms) >= self.max_rooms:
+                raise Refused("this server is holding as many relay rooms as it will (%d); "
+                              "try again when a visit ends" % self.max_rooms)
+
+            del self._invites[(inviter_id, accepter_id)]
+            # An open host may have two visitors waiting while the first admission finishes.
+            # Consuming one invitation must not erase the other visitor's independent request.
+            self._forget_invites_locked(child.user_id)
+            if not parent.public_open:
+                self._forget_invites_locked(parent.user_id)
+
+            first_child = room is None
+            if first_child:
+                room = Room(next(self._room_ids), parent.user_id, now,
+                            parent_public=parent.public(),
+                            public_open=parent.public_open)
+                self._rooms[room.room_id] = room
+            prior_members = room.members()
+            aid = room.add_child(child.user_id, child.public(), invitation.invite_id)
+            if first_child:
+                parent_session = self._sessions.get(parent.user_id)
+                if parent_session is not None:
+                    room.lobby_gens[parent.user_id] = parent_session.generation
+            child_session = self._sessions.get(child.user_id)
+            if child_session is not None:
+                room.lobby_gens[child.user_id] = child_session.generation
+
+            # A public host remains discoverable until three children occupy the town. Every
+            # child leaves the waiting list as soon as its slot is committed. Legacy pair
+            # rooms retain the original behavior in which both waiters disappear.
+            self._waiters.pop(child.user_id, None)
+            if not room.public_open:
+                self._waiters.pop(parent.user_id, None)
+
+            members = room.member_rows()
+            if first_child:
+                self._queue_session_locked(
+                    self._sessions.get(parent.user_id),
+                    {"t": "matched", "room": room.room_id,
+                     "peer": room.children_public[child.user_id], "role": "parent",
+                     "aid": 0, "members": members,
+                     "invite_id": invitation.invite_id},
+                )
+            else:
+                joined = {"t": "member_joined", "room": room.room_id,
+                          "member": dict(room.children_public[child.user_id], aid=aid),
+                          "members": members, "invite_id": invitation.invite_id}
+                for member_id in prior_members:
+                    self._queue_session_locked(self._sessions.get(member_id), joined)
             self._queue_session_locked(
                 self._sessions.get(child.user_id),
                 {"t": "matched", "room": room.room_id,
-                 "peer": room.parent_public, "role": "child",
-                 "invite_id": room.invite_id},
+                 "peer": room.parent_public, "role": "child", "aid": aid,
+                 "members": members, "invite_id": invitation.invite_id},
             )
+            # A PC client deliberately keeps one visible invitation: the game admits one
+            # visitor at a time.  Several guests can request the same open town while an
+            # arrival is running, so their earlier pushes may have occupied that single
+            # slot and then been superseded.  After each committed member, replay exactly
+            # the oldest still-valid request.  The invite id is unchanged, and match()
+            # still consumes it atomically, so this adds no second authorization path.
+            pending = [item for item in self._invites.values()
+                       if item.target_id == parent.user_id]
+            if room.public_open and pending:
+                next_invitation = min(pending, key=lambda item: item.invite_id)
+                next_waiter = self._waiters.get(next_invitation.inviter_id)
+                if next_waiter is not None:
+                    self._queue_session_locked(
+                        self._sessions.get(parent.user_id),
+                        {"t": "invite", "from": next_waiter.public(),
+                         "invite_id": next_invitation.invite_id},
+                    )
             return room
 
     def _active_room_locked(self, user_id: int) -> Room | None:
@@ -573,15 +734,18 @@ class LobbyState:
         if room is None:
             return
         if user_id == room.parent_id:
-            peer, role, public = room.child_id, "parent", room.child_public
+            peer, role, public, aid = room.child_id, "parent", room.child_public, 0
         else:
-            peer, role, public = room.parent_id, "child", room.parent_public
+            peer, role, public, aid = (room.parent_id, "child", room.parent_public,
+                                       room.aid_of(user_id))
         if public is None:
             public = {"user_id": peer}
         self._queue_session_locked(
             session,
             {"t": "matched", "room": room.room_id, "peer": public,
-             "role": role, "invite_id": room.invite_id},
+             "role": role, "aid": aid, "members": room.member_rows(),
+             "invite_id": room.invite_ids.get(user_id) if role == "child"
+                          else room.invite_id},
         )
 
     def _mutation_owner_locked(self, user_id: int, socket: Any,
@@ -609,7 +773,7 @@ class LobbyState:
                             room.room_id if room is not None else None, ())
 
     async def abort_room(self, room_id: int, user_id: int, socket: Any,
-                         generation: int) -> tuple[Any, ...] | None:
+                         generation: int) -> tuple[Any, ...] | RelayLeaveResult | None:
         """Revoke this member's exact room; caller closes returned sockets outside the lock.
 
         Pending-invitation cancellation deliberately cannot do this. The gate's preparation
@@ -622,6 +786,17 @@ class LobbyState:
             room = self._rooms.get(room_id)
             if room is None or user_id not in room.members():
                 return None
+            if room.public_open and user_id != room.parent_id:
+                aid = room.aid_of(user_id)
+                leaving = room.sockets.get(user_id)
+                room.remove_child(user_id)
+                survivors = tuple(room.sockets.values())
+                payload = {"t": "member_left", "room": room_id, "aid": aid,
+                           "user_id": user_id, "members": room.member_rows()}
+                for member in room.members():
+                    self._queue_session_locked(self._sessions.get(member), payload)
+                return RelayLeaveResult(False, aid, survivors,
+                                        (leaving,) if leaving is not None else ())
             del self._rooms[room_id]
             sockets = tuple(room.sockets.values())
             # Relay handlers retain the Room object. Invalidate its generations as well as
@@ -631,6 +806,9 @@ class LobbyState:
             for member in room.members():
                 self._queue_session_locked(self._sessions.get(member),
                     {"t": "room_aborted", "room": room_id, "by": user_id})
+            if room.public_open:
+                self._waiters.pop(room.parent_id, None)
+                return RelayLeaveResult(True, room.aid_of(user_id), (), sockets)
             return sockets
 
     async def join_room(self, room_id: int, user_id: int,
@@ -663,23 +841,58 @@ class LobbyState:
             room = self._rooms.get(room_id)
             if room is None or not room.current(user_id, generation):
                 return None
-            return room.sockets.get(room.peer_of(user_id))
+            targets = room.forward_targets(user_id)
+            return targets[0] if targets else None
 
-    async def leave_room(self, room_id: int, user_id: int, socket: Any) -> Any:
-        """Remove a peer and FREE the room. Returns the survivor's socket, if connected."""
+    async def may_forward_many(self, room_id: int, user_id: int,
+                               generation: int) -> tuple[Any, ...] | None:
+        """Current forwarding targets for a room writer, or None for a stale writer.
+
+        The WM topology is parent-centred: parent broadcasts reach every connected child,
+        while a child's frame reaches only the parent. The server still does not inspect the
+        game's binary frame.
+        """
         async with self._lock:
-            room = self._rooms.pop(room_id, None)
+            room = self._rooms.get(room_id)
+            if room is None or not room.current(user_id, generation):
+                return None
+            return room.forward_targets(user_id)
+
+    async def leave_room(self, room_id: int, user_id: int,
+                         socket: Any) -> RelayLeaveResult | None:
+        """Remove one current relay generation and describe who remains.
+
+        Legacy pair rooms retain their all-or-nothing close. In a public four-player room a
+        child departure removes only that AID; the host and other children keep playing. A
+        parent departure closes the room for everyone.
+        """
+        async with self._lock:
+            room = self._rooms.get(room_id)
             if room is None:
                 return None
             if room.sockets.get(user_id) is not socket:
-                # A stale close for a socket that was already replaced: put it back. The
-                # replacement keeps the room and its own generation (F6).
-                self._rooms[room_id] = room
                 return None
+            aid = room.aid_of(user_id)
+            if aid is None:
+                return None
+            if room.public_open and user_id != room.parent_id:
+                room.remove_child(user_id)
+                survivors = tuple(room.sockets.values())
+                payload = {"t": "member_left", "room": room_id, "aid": aid,
+                           "user_id": user_id, "members": room.member_rows()}
+                for member_id in room.members():
+                    self._queue_session_locked(self._sessions.get(member_id), payload)
+                return RelayLeaveResult(False, aid, survivors, ())
+
+            del self._rooms[room_id]
             room.sockets.pop(user_id, None)
             room.gens.pop(user_id, None)
-            survivors = list(room.sockets.values())
-            return survivors[0] if survivors else None
+            survivors = tuple(room.sockets.values())
+            room.sockets.clear()
+            room.gens.clear()
+            if room.public_open:
+                self._waiters.pop(room.parent_id, None)
+            return RelayLeaveResult(True, aid, (), survivors)
 
     def _sweep_locked(self) -> None:
         try:

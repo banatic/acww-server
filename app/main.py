@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import logging_ as log
 from .config import SERVICE_VERSION, Settings
-from .lobby import LobbyState, Refused
+from .lobby import LobbyState, Refused, RelayLeaveResult
 from .savecheck import FLASH_SIZE as SAVE_BYTES
 from .savecheck import SaveRejected, sha256_hex, validate_card_image
 from .security import (HASHER, Budget, RateLimiter, hash_password, is_trusted_proxy,
@@ -37,7 +37,8 @@ WS_POLICY_VIOLATION = 1008
 WS_MESSAGE_TOO_BIG = 1009          # RFC 6455's own code for "that frame was too large"
 WS_TRY_AGAIN_LATER = 1013
 MAX_REQUEST_ID = 64                 # lobby correlation is bounded before any state change
-LOBBY_CAPABILITIES = ("cancel", "invite_id", "command_request_id", "abort_room")
+LOBBY_CAPABILITIES = ("cancel", "invite_id", "command_request_id", "abort_room",
+                      "multi_room_v1")
 REQUEST_ID_ERROR = ("request_id must be a non-empty string of at most %d characters"
                     % MAX_REQUEST_ID)
 
@@ -643,11 +644,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not isinstance(town, str) or len(town) > 32:
                 await command_error("town_name must be a short string")
                 return
+            public_open = msg.get("open") is True
+            if "open" in msg and type(msg.get("open")) is not bool:
+                await command_error("open must be a boolean")
+                return
+            if public_open and mode != "host":
+                await command_error("only a host can open a public town")
+                return
             accepted = await lobby.wait(user_id, username, town, mode, websocket,
-                                        generation)
+                                        generation, public_open)
             if not accepted:
                 return
-            log.event("lobby.wait", user_id=user_id, mode=mode)
+            log.event("lobby.wait", user_id=user_id, mode=mode, public_open=public_open)
             await _broadcast_list()
             return
         if kind == "leave":
@@ -670,12 +678,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await _lobby_send(user_id, websocket,
                 {"t": "room_abort_ack", "room": room_id, "request_id": request_id},
                 generation)
-            for relay_socket in sockets:
-                try:
-                    await _send(relay_socket, {"t": "peer_left"})
-                    await relay_socket.close(code=1000)
-                except Exception:
-                    pass
+            if isinstance(sockets, RelayLeaveResult):
+                for relay_socket in sockets.notify_sockets:
+                    try:
+                        await _send(relay_socket, {"t": "member_left", "room": room_id,
+                                                   "aid": sockets.aid})
+                    except Exception:
+                        pass
+                for relay_socket in sockets.close_sockets:
+                    try:
+                        if sockets.room_closed:
+                            await _send(relay_socket, {"t": "peer_left", "room": room_id,
+                                                       "aid": sockets.aid,
+                                                       "room_closed": True})
+                        await relay_socket.close(code=1000)
+                    except Exception:
+                        pass
+                await _broadcast_list()
+            else:
+                for relay_socket in sockets:
+                    try:
+                        await _send(relay_socket, {"t": "peer_left"})
+                        await relay_socket.close(code=1000)
+                    except Exception:
+                        pass
             log.event("lobby.room_abort", user_id=user_id, room=room_id)
             return
         if kind == "cancel":
@@ -786,8 +812,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if room is None:
                 await command_error("that invite is no longer valid")
                 return
+            # Either endpoint may have sent the invitation.  Log the member whose role is
+            # actually child rather than assuming the inviter filled that role.
+            child_id = user_id if user_id != room.parent_id else origin
             log.event("lobby.matched", room=room.room_id, parent=room.parent_id,
-                      child=room.child_id)
+                      child=child_id, players=len(room.members()))
             await _broadcast_list()
             return
         await command_error("unknown message type %r" % (kind,))
@@ -822,9 +851,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await displaced.close(code=WS_POLICY_VIOLATION)
             except Exception:
                 pass
-        peer_id = room_state.peer_of(user_id)
-        log.event("relay.open", room=room, user_id=user_id, peer=peer_id,
-                  generation=generation)
+        aid = room_state.aid_of(user_id)
+        if room_state.public_open:
+            await _send(websocket, {"t": "room_state", "room": room, "aid": aid,
+                                    "members": room_state.member_rows(), "max_players": 4})
+        log.event("relay.open", room=room, user_id=user_id, aid=aid,
+                  generation=generation, players=len(room_state.members()))
         frames = 0
         try:
             while True:
@@ -841,6 +873,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                   size=len(payload))
                         await websocket.close(code=WS_MESSAGE_TOO_BIG)
                         return
+                    # MULTI114. The bridge's v3 header names its source AID in byte 63.
+                    # Authenticate that one routing field against the relay membership;
+                    # the remaining bytes stay opaque game data. Without this check a child
+                    # could impersonate another AID inside the parent's aggregated MP cycle.
+                    if (room_state.public_open
+                            and (len(payload) < 68 or payload[4] != 3
+                                 or payload[63] != aid)):
+                        log.event("relay.bad_source_aid", level="warn", room=room,
+                                  user_id=user_id, aid=aid, size=len(payload))
+                        await websocket.close(code=WS_POLICY_VIOLATION)
+                        return
                     # F5. Frames and bytes, per account and per address.
                     keys = ["user:%d" % user_id, "ip:" + ip]
                     if not _spend("relay_ops", keys) \
@@ -850,15 +893,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         return
                     # F6. Asked for every frame, under the lobby's lock: a captured socket
                     # reference is exactly what a superseded connection still holds.
-                    peer = await lobby.may_forward(room, user_id, generation)
-                    if peer is None and not room_state.current(user_id, generation):
+                    targets = await lobby.may_forward_many(room, user_id, generation)
+                    if targets is None:
                         log.event("relay.superseded", level="warn", room=room,
                                   user_id=user_id, generation=generation)
                         await websocket.close(code=WS_POLICY_VIOLATION)
                         return
-                    if peer is not None:
+                    for peer in targets:
                         try:
-                            # Verbatim. The server never reads kind, port or length.
+                            # Verbatim. The server chooses recipients from authenticated room
+                            # membership but never reads kind, port, length or game payload.
                             await peer.send_bytes(payload)
                             frames += 1
                         except Exception:
@@ -884,14 +928,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log.event("relay.error", level="warn", room=room, user_id=user_id,
                       error=repr(exc))
         finally:
-            survivor = await lobby.leave_room(room, user_id, websocket)
+            departure = await lobby.leave_room(room, user_id, websocket)
             log.event("relay.close", room=room, user_id=user_id, frames_forwarded=frames)
-            if survivor is not None:
-                await _send(survivor, {"t": "peer_left"})
-                try:
-                    await survivor.close(code=1000)
-                except Exception:
-                    pass
+            if departure is not None:
+                for survivor in departure.notify_sockets:
+                    try:
+                        await _send(survivor, {"t": "member_left", "room": room,
+                                               "aid": departure.aid})
+                    except Exception:
+                        pass
+                for survivor in departure.close_sockets:
+                    payload = ({"t": "peer_left", "room": room, "aid": departure.aid,
+                                "room_closed": departure.room_closed}
+                               if room_state.public_open else {"t": "peer_left"})
+                    await _send(survivor, payload)
+                    try:
+                        await survivor.close(code=1000)
+                    except Exception:
+                        pass
+                await _broadcast_list()
 
     # ---------------------------------------------------------------- health
 
