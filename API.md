@@ -230,3 +230,19 @@ packed `dist/acww.exe` -- register, login, save round trip with `If-Match`, the 
 two processes matched and relaying in the lobby, and TLS through nginx. The container's whole
 log contains **zero** occurrences of `token=`, and the handshake records read
 `"WebSocket /v1/lobby/ws" [accepted]` with no query string at all.
+## Windows executable updates (UPDATE123)
+
+Both routes require the ordinary account bearer token and consume the HTTP operation
+budget. They are independent of save upload byte budgets. TLS is terminated at the NAS;
+the client requires verified HTTPS for these routes and never follows redirects.
+
+- `GET /v1/updates/windows`: `{"protocol":1,"sha256":"<64 lowercase hex>","size":N,
+  "path":"/v1/updates/windows/<sha256>.exe"}` with `Cache-Control: no-store`.
+  Returns 404 if `/data/updates/acww.exe` is absent, incomplete, or not a valid PE32
+  ACWWPAY2 package. The manifest is recomputed when the file fingerprint changes.
+- `GET /v1/updates/windows/{sha256}.exe`: streams the matching open file descriptor,
+  with Content-Length, an SHA-based ETag, and no-store. A superseded digest returns 404;
+  at most two downloads run concurrently (429 otherwise). Disconnect releases the slot.
+- Clients compare the entire executable hash, prompt before downloading, enforce the
+  exact size/hash before installation, and never execute a URL/command from the manifest.
+  Hash identity intentionally permits operator-directed rollback as well as upgrade.

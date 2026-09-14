@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -31,6 +32,7 @@ from .savecheck import SaveRejected, sha256_hex, validate_card_image
 from .security import (HASHER, Budget, RateLimiter, hash_password, is_trusted_proxy,
                        make_token, needs_rehash, read_token, verify_password)
 from .store import Store
+from .updates import Updates, UpdateUnavailable, DownloadResponse, CHUNK
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 MIN_PASSWORD = 8
@@ -948,6 +950,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     except Exception:
                         pass
                 await _broadcast_list()
+
+    # Authenticated executable delivery is separate from save upload byte budgets.
+    updates = Updates(settings.data_dir)
+
+    @app.get("/v1/updates/windows")
+    async def update_manifest(request: Request,
+                              authorization: str | None = Header(default=None)):
+        user = _identify(authorization)
+        _http_budget(request, user["id"])
+        try:
+            info = await run_in_threadpool(updates.manifest)
+        except UpdateUnavailable:
+            raise HTTPException(404, "no complete Windows update is published")
+        return JSONResponse(info, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/updates/windows/{digest}.exe")
+    async def update_download(digest: str, request: Request,
+                              authorization: str | None = Header(default=None)):
+        user = _identify(authorization)
+        _http_budget(request, user["id"])
+        if not updates.downloads.acquire(blocking=False):
+            raise HTTPException(429, "two update downloads are already running")
+        try:
+            f, info = await run_in_threadpool(updates.open_download, digest)
+        except (UpdateUnavailable, OSError):
+            updates.downloads.release()
+            raise HTTPException(404, "this update is no longer available; check again")
+        except BaseException:
+            updates.downloads.release()
+            raise
+
+        close_lock = threading.Lock()
+
+        def close():
+            with close_lock:
+                if not f.closed:
+                    f.close()
+                    updates.downloads.release()
+
+        def chunks():
+            try:
+                remaining = info["size"]
+                while remaining:
+                    block = f.read(min(remaining, CHUNK))
+                    if not block:
+                        break
+                    remaining -= len(block)
+                    yield block
+            finally:
+                close()
+
+        return DownloadResponse(chunks(), media_type="application/octet-stream",
+                                 headers={"Content-Length": str(info["size"]),
+                                          "Cache-Control": "no-store",
+                                          "ETag": '"' + digest + '"'},
+                                 cleanup=close)
 
     # ---------------------------------------------------------------- health
 
