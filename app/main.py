@@ -33,6 +33,7 @@ from .security import (HASHER, Budget, RateLimiter, hash_password, is_trusted_pr
                        make_token, needs_rehash, read_token, verify_password)
 from .store import Store
 from .updates import Updates, UpdateUnavailable, DownloadResponse, CHUNK
+from .chat_routes import install_chat
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 MIN_PASSWORD = 8
@@ -201,6 +202,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.limiter = limiter
     app.state.lobby = lobby
     app.state.budgets = budgets
+    install_chat(app, settings, store, lobby, _client_key)
 
     # ---------------------------------------------------------------- F3 / F5 helpers
 
@@ -1014,6 +1016,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         waiting, rooms = lobby.counts()
         return JSONResponse({"ok": True, "version": SERVICE_VERSION,
                              "commit": build_commit(),
+                             "capabilities": ["chat_v1", "presence_v1"] if settings.chat_enabled else [],
                              "users": store.user_count(),
                              "waiting": waiting, "rooms": rooms},
                             headers={"Cache-Control": "no-store"})

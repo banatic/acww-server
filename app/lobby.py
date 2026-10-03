@@ -278,6 +278,31 @@ class LobbyState:
             result.append(row)
         return result
 
+    async def public_town_snapshot(self) -> list[dict]:
+        """Copy public registration, including full rooms; never promise game arrival.
+
+        The caller releases this lock before publishing to chat. Private membership,
+        sockets and room credentials never leave this method.
+        """
+        async with self._lock:
+            rows: dict[int, dict] = {}
+            for waiter in self._waiters.values():
+                if waiter.public_open:
+                    rows[waiter.user_id] = {
+                        "user_id": waiter.user_id, "username": waiter.username,
+                        "town_name": waiter.town_name, "players": 1, "capacity": 4,
+                        "state": "registered"}
+            for room in self._rooms.values():
+                if not room.public_open:
+                    continue
+                public = room.parent_public or {}
+                players = len(room.members())
+                rows[room.parent_id] = {
+                    "user_id": room.parent_id, "username": public.get("username", ""),
+                    "town_name": public.get("town_name", ""), "players": players,
+                    "capacity": 4, "state": "full" if players >= 4 else "registered"}
+            return [rows[key] for key in sorted(rows)]
+
     def counts(self) -> tuple[int, int]:
         return len(self.waiting_list()), len(self._rooms)
 

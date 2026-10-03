@@ -115,6 +115,8 @@ class Settings:
     relay_bytes_per_sec: float = 512.0 * 1024
     max_lobby_sockets: int = 32        # sockets this process will hold at once
     max_rooms: int = 16                # live relay rooms at once
+    chat_enabled: bool = True
+    max_chat_sockets: int = 128
 
     @property
     def db_path(self) -> Path:
@@ -159,6 +161,8 @@ class Settings:
             relay_bytes_per_sec=_env_float("ACWW_RELAY_BYTES_PER_SEC", 512.0 * 1024),
             max_lobby_sockets=_env_int("ACWW_MAX_LOBBY_SOCKETS", 32),
             max_rooms=_env_int("ACWW_MAX_ROOMS", 16),
+            chat_enabled=_env_bool("ACWW_CHAT_ENABLED", True),
+            max_chat_sockets=max(1, min(128, _env_int("ACWW_MAX_CHAT_SOCKETS", 128))),
         )
 
 

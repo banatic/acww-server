@@ -246,3 +246,69 @@ the client requires verified HTTPS for these routes and never follows redirects.
 - Clients compare the entire executable hash, prompt before downloading, enforce the
   exact size/hash before installation, and never execute a URL/command from the manifest.
   Hash identity intentionally permits operator-directed rollback as well as upgrade.
+
+## Global chat v1 (GCHAT, client integration in progress)
+
+`WS /v1/chat/ws` requires an Authorization bearer header; query tokens are refused.
+It is independent of lobby/relay membership. `/v1/health.capabilities` includes
+`chat_v1,presence_v1` when `ACWW_CHAT_ENABLED=1` (default). Set0 and restart to disable
+chat alone. `ACWW_MAX_CHAT_SOCKETS` defaults128, clamped1..128. One worker only.
+Server implementation does not mean the game client already uses this endpoint.
+
+Every envelope is a JSON object with integer `v:1` and string `t`. Receive ceiling
+4096 UTF-8 bytes, text frames only. Invalid/binary/oversized traffic closes this
+chat connection, not its lobby or relay. The server derives identity from the
+token and ignores user_id/username supplied with a send. Token expiry is enforced
+even on an otherwise idle open socket. Replacement closes the old chat generation
+only; one presence row per account. Clean close removes it immediately.
+
+| Client type | Fields | Result |
+|---|---|---|
+| send | id:1..64 ASCII letters/digits/underscore/dot/hyphen, text | accepted acknowledgement plus authoritative message echo to all current chat sessions |
+| presence | optional snapshot and page | private stable presence_page; first request omits snapshot and uses page0 |
+| resume | epoch:string, seq:nonnegative integer | retained message events then resumed, or gap |
+| ping / pong | none | ping receives pong; pong refreshes presence |
+
+`hello` supplies epoch, latest seq, max_text_units16, heartbeat_seconds20 and
+capabilities. Text must be nonblank, at most16 BMP units, without control codes,
+surrogates, noncharacters or the game's0x100..0x123 keyboard command range. The
+client additionally validates game-font coverage and pixel width; the server
+does not contain ROM font data. Full account username is retained on the wire.
+The client must make any shorter display-label policy explicit.
+
+`message` carries epoch, seq, id, user_id, username, text and UTC. `accepted` carries
+id, epoch, seq. It means accepted by the in-memory server, not displayed by every
+recipient. Sender renders its message event once, not both the optimistic local
+send and the echo. Duplicate(account,id) with unchanged text returns the original
+acknowledgement without another broadcast; changed text is id_conflict. Dedup is
+bounded to4096 records /10 minutes and does not survive restart.
+
+History is128 events /10 minutes, with a random epoch per hub. An unavailable,
+future or wrong-epoch cursor receives gap with the current epoch/seq. Replay is
+paged to fit the outbound queue; resumed.seq is the delivered cursor and
+resumed.more requests another resume. No silent exactly-once promise across a
+restart or beyond retention. Uncertain sends must not auto-repost into a new epoch.
+
+Each socket has its own64-event queue and writer with a5-second send deadline.
+Overflow closes only that slow reader. Chat sends allow burst3 then1/s/account;
+reconnection retains that budget. Envelope operations have a separate account
+budget30 burst /5 per second. Handshakes have an IP budget10 burst /1 per second.
+Presence requires traffic every60 seconds; the server prompts with ping after20
+seconds idle. No message body is written to normal application logs or storage.
+
+Presence pages contain at most8 rows and a snapshot ID valid300 seconds, page,
+pages,total,user_count,town_count and coverage=`chat_sessions`. User rows have
+kind=user,user_id,username. Town rows have kind=town,user_id,username,town_name,
+players,capacity,state. Full public rooms are included; private membership is
+excluded. `players` counts admitted/reserved slots, not proved in-game arrivals.
+`registered` describes server host registration; `full` describes capacity4.
+These states do NOT yet claim actual gate readiness. Legacy clients without chat
+heartbeat are not counted as online users. Subsequent pages retain the same
+snapshot even if membership changes. The response goes only to its requester.
+
+`error` includes a bounded code and the request id when valid. This contract leaves
+the `online`, `/online`, `/say online` text command parsing to the game adapter;
+the wire request for presence never becomes a global message. Per-user mute,
+client draft recovery and bounded original-UI presentation are implemented in
+the opt-in game adapter. Gate-readiness reporting, physical IME and the real NAS
+proxy audit still require release evidence beyond these server primitives.
