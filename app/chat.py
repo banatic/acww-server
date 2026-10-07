@@ -25,6 +25,13 @@ HEARTBEAT_EXPIRY = 60.0
 PAGE_SIZE = 8
 SNAPSHOT_EXPIRY = 300.0       # A full original-game bubble page can take over a minute.
 ID = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
+# NOTICE155: ephemeral system lines ("X joined", "X sold N bells"). They are never sequenced
+# or replayed, and they go ONLY to sessions that announced `notice_v1` when they connected:
+# an older client treats any event type it cannot decode as a protocol error and reconnects.
+NOTICE_FEATURE = "notice_v1"
+JOIN_QUIET = 120.0            # a reconnect within this window is a blip, not an arrival
+ACTIVITY_KINDS = ("shop_sell", "shop_buy")
+MAX_BELLS = 9_999_999
 
 
 class ChatError(ValueError):
@@ -68,6 +75,7 @@ class ChatSession:
     closed: asyncio.Event = field(default_factory=asyncio.Event)
     close_reason: str = ""
     snapshot: tuple[str, float, list[dict]] | None = None
+    notices: bool = False
 
 
 class ChatHub:
@@ -81,6 +89,8 @@ class ChatHub:
         self.history: deque[tuple[float, dict]] = deque(maxlen=MAX_HISTORY)
         self.dedup: OrderedDict[tuple[int, str], tuple[float, dict]] = OrderedDict()
         self.rates: OrderedDict[int, tuple[float, float]] = OrderedDict()
+        self.activity_rates: OrderedDict[int, tuple[float, float]] = OrderedDict()
+        self.last_left: OrderedDict[int, float] = OrderedDict()
 
     def close(self, session: ChatSession, reason: str) -> None:
         if not session.closed.is_set():
@@ -89,6 +99,20 @@ class ChatHub:
             session.closed.set()
         if self.sessions.get(session.user_id) is session:
             del self.sessions[session.user_id]
+            self.last_left[session.user_id] = self.clock()
+            self.last_left.move_to_end(session.user_id)
+            while len(self.last_left) > 4096:
+                self.last_left.popitem(last=False)
+
+    def notice(self, kind: str, session: ChatSession, *, include_self: bool = True, **extra) -> dict:
+        """Broadcast one system line to every notice-capable session."""
+        event = {"v": 1, "t": "notice", "kind": kind, "user_id": session.user_id,
+                 "username": session.username,
+                 "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), **extra}
+        for target in list(self.sessions.values()):
+            if target.notices and (include_self or target is not session):
+                self.emit(target, event)
+        return copy.deepcopy(event)
 
     def sweep(self) -> None:
         now = self.clock()
@@ -118,20 +142,48 @@ class ChatHub:
             self.close(session, "slow_reader")
             return False
 
-    def attach(self, user_id: int, username: str) -> ChatSession:
+    def attach(self, user_id: int, username: str, *, notices: bool = False) -> ChatSession:
         self.sweep()
         if user_id not in self.sessions and len(self.sessions) >= self.max_sessions:
             raise ChatError("capacity")
         old = self.sessions.get(user_id)
+        # An arrival is a user with no session now and none within JOIN_QUIET: a replaced
+        # socket or a reconnect after a network blip says nothing.
+        left = self.last_left.get(user_id)
+        arrival = old is None and (left is None or self.clock() - left >= JOIN_QUIET)
         if old is not None:
             self.close(old, "replaced")
         self.generation += 1
-        session = ChatSession(user_id, username, self.generation, self.clock())
+        session = ChatSession(user_id, username, self.generation, self.clock(), notices=notices)
         self.sessions[user_id] = session
         self.emit(session, {"v": 1, "t": "hello", "epoch": self.epoch,
                             "seq": self.sequence, "max_text_units": MAX_TEXT,
-                            "heartbeat_seconds": 20, "capabilities": ["chat_v1", "presence_v1"]})
+                            "heartbeat_seconds": 20,
+                            "capabilities": ["chat_v1", "presence_v1", NOTICE_FEATURE]})
+        if arrival:
+            self.notice("join", session, include_self=False)
         return session
+
+    def activity(self, session: ChatSession, kind: object, bells: object) -> dict:
+        """A client-reported game event (a shop sale or purchase), broadcast as a notice.
+
+        Only the kind and the amount come from the client; the name is the session's."""
+        self.require(session)
+        if kind not in ACTIVITY_KINDS:
+            raise ChatError("invalid_activity")
+        if type(bells) is not int or not 1 <= bells <= MAX_BELLS:
+            raise ChatError("invalid_activity")
+        now = self.clock()
+        tokens, previous = self.activity_rates.get(session.user_id, (3.0, now))
+        tokens = min(3.0, tokens + max(0.0, now - previous) / 2.0)
+        if tokens < 1.0:
+            self.activity_rates[session.user_id] = (tokens, now)
+            raise ChatError("rate_limited")
+        self.activity_rates[session.user_id] = (tokens - 1.0, now)
+        self.activity_rates.move_to_end(session.user_id)
+        while len(self.activity_rates) > 4096:
+            self.activity_rates.popitem(last=False)
+        return self.notice(kind, session, bells=bells)
 
     def touch(self, session: ChatSession) -> None:
         self.require(session)

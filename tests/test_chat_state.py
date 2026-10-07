@@ -151,3 +151,58 @@ def test_public_town_snapshot_includes_full_room_and_excludes_private_members():
     assert asyncio.run(lobby.public_town_snapshot()) == [
         {"user_id": 10, "username": "host", "town_name": "town", "players": 4,
          "capacity": 4, "state": "full"}]
+
+
+def test_notice_reaches_only_capable_sessions_and_never_the_sequence():
+    clock = [1000.0]
+    hub = ChatHub(clock=lambda: clock[0])
+    old = hub.attach(1, "old")                     # an older client: no notice_v1
+    new = hub.attach(2, "new", notices=True)
+    drain(old); drain(new)
+    hub.attach(3, "arrive", notices=True)
+    assert drain(old) == []
+    [join] = drain(new)
+    assert (join["t"], join["kind"], join["username"]) == ("notice", "join", "arrive")
+    hub.activity(new, "shop_sell", 1200)
+    events = drain(new)
+    assert [(e["t"], e["kind"], e["bells"]) for e in events] == [("notice", "shop_sell", 1200)]
+    assert drain(old) == [] and hub.sequence == 0 and not hub.history
+
+
+def test_join_notice_skips_replacements_and_quick_reconnects():
+    clock = [1000.0]
+    hub = ChatHub(clock=lambda: clock[0])
+    watcher = hub.attach(9, "watch", notices=True)
+    drain(watcher)
+    a = hub.attach(1, "alpha", notices=True)
+    assert [e["kind"] for e in drain(watcher)] == ["join"]
+    assert [e["t"] for e in drain(a)] == ["hello"]          # no notice of one's own arrival
+    hub.attach(1, "alpha", notices=True)                    # replaced socket
+    assert drain(watcher) == []
+    hub.close(hub.sessions[1], "disconnected")
+    clock[0] += 30
+    hub.attach(1, "alpha", notices=True)                    # back within JOIN_QUIET
+    assert drain(watcher) == []
+    hub.close(hub.sessions[1], "disconnected")
+    clock[0] += 121
+    watcher.last_seen = clock[0]
+    hub.attach(1, "alpha", notices=True)
+    assert [e["kind"] for e in drain(watcher)] == ["join"]
+
+
+def test_activity_is_validated_and_rate_limited():
+    clock = [1000.0]
+    hub = ChatHub(clock=lambda: clock[0])
+    s = hub.attach(1, "alpha", notices=True)
+    drain(s)
+    for kind, bells in (("shop_steal", 5), ("shop_sell", 0), ("shop_buy", -3),
+                        ("shop_sell", 10_000_000), ("shop_sell", 1.5), ("shop_sell", True)):
+        with pytest.raises(ChatError, match="invalid_activity"):
+            hub.activity(s, kind, bells)
+    for _ in range(3):
+        hub.activity(s, "shop_buy", 80)
+    with pytest.raises(ChatError, match="rate_limited"):
+        hub.activity(s, "shop_buy", 80)
+    clock[0] += 2.0
+    hub.activity(s, "shop_buy", 80)
+    assert len(drain(s)) == 4

@@ -126,3 +126,28 @@ def test_duplicate_fields_and_deep_json_cannot_break_reader(server):
             assert reply["v"] == 1 and reply["t"] == "error" and reply["code"] in codes
         send(ws, t="ping")
         assert recv(ws)["t"] == "pong"
+
+
+def test_notices_follow_the_feature_header(server):
+    ta, aid = account(server, "alpha")
+    tb, _ = account(server, "bravo")
+    tc, _ = account(server, "charlie")
+    with connect(server.ws_base + "/v1/chat/ws", open_timeout=5,
+                 additional_headers={"Authorization": "Bearer " + ta,
+                                     "X-ACWW-Chat-Features": "notice_v1"}) as a, \
+            open_chat(server, tb) as old:
+        assert "notice_v1" in recv(a)["capabilities"]
+        assert recv(old)["t"] == "hello"
+        assert recv(a)["username"] == "bravo"               # an old client's arrival is news too
+        with open_chat(server, tc) as late:                  # an arrival
+            recv(late)
+            join = recv(a)
+            assert (join["t"], join["kind"], join["username"]) == ("notice", "join", "charlie")
+            send(a, t="activity", kind="shop_sell", bells=1200, username="spoof")
+            sale = recv(a)
+            assert (sale["kind"], sale["bells"], sale["user_id"], sale["username"]) == \
+                ("shop_sell", 1200, aid, "alpha")
+            send(a, t="activity", kind="shop_sell", bells="1200")
+            assert recv(a) == {"v": 1, "t": "error", "code": "invalid_activity"}
+            send(old, t="ping")
+            assert recv(old)["t"] == "pong"                  # the old client saw no notice

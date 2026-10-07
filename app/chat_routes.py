@@ -8,7 +8,7 @@ import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from .chat import ChatError, ChatHub, ID
+from .chat import ChatError, ChatHub, ID, NOTICE_FEATURE
 from .security import Budget, read_token
 
 
@@ -45,8 +45,12 @@ def install_chat(app, settings, store, lobby, client_key):
             await ws.close(code=1008)
             return
         await ws.accept()
+        # NOTICE155: a client that can decode `notice` events says so in this header; an
+        # older client never sees one (it would treat the unknown type as a protocol error).
+        features = {f.strip() for f in ws.headers.get("x-acww-chat-features", "").split(",")}
         try:
-            session = hub.attach(int(user["id"]), user["username"])
+            session = hub.attach(int(user["id"]), user["username"],
+                                 notices=NOTICE_FEATURE in features)
         except ChatError:
             await ws.close(code=1013)
             return
@@ -98,6 +102,8 @@ def install_chat(app, settings, store, lobby, client_key):
                         hub.presence(session, towns, snapshot_id=msg.get("snapshot"), page=msg.get("page", 0))
                     elif kind == "resume":
                         hub.resume(session, msg.get("epoch"), msg.get("seq"))
+                    elif kind == "activity":
+                        hub.activity(session, msg.get("kind"), msg.get("bells"))
                     elif kind == "ping":
                         hub.emit(session, {"v": 1, "t": "pong"})
                     elif kind == "pong":
