@@ -1016,7 +1016,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         waiting, rooms = lobby.counts()
         return JSONResponse({"ok": True, "version": SERVICE_VERSION,
                              "commit": build_commit(),
-                             "capabilities": ["chat_v1", "presence_v1"] if settings.chat_enabled else [],
+                             "capabilities": ["chat_v1", "presence_v1", "notice_v1"] if settings.chat_enabled else [],
                              "users": store.user_count(),
                              "waiting": waiting, "rooms": rooms},
                             headers={"Cache-Control": "no-store"})

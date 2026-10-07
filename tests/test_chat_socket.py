@@ -45,7 +45,7 @@ def test_two_users_chat_without_lobby_or_room_and_presence_is_private(server):
         assert recv(b)["t"] == "pong"  # no leaked private presence response
         health = httpx.get(server.base + "/v1/health", timeout=5).json()
         assert health["waiting"] == health["rooms"] == 0
-        assert "chat_v1" in health["capabilities"]
+        assert {"chat_v1", "notice_v1"} <= set(health["capabilities"])
 
 
 def test_duplicate_ack_does_not_broadcast_twice_and_malformed_text_is_refused(server):
