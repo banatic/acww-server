@@ -268,7 +268,7 @@ only; one presence row per account. Clean close removes it immediately.
 | presence | optional snapshot and page | private stable presence_page; first request omits snapshot and uses page0 |
 | resume | epoch:string, seq:nonnegative integer | retained message events then resumed, or gap |
 | ping / pong | none | ping receives pong; pong refreshes presence |
-| activity | kind: `shop_sell` or `shop_buy`, bells: integer 1..9,999,999 | a `notice` to every notice-capable session, the sender included; `invalid_activity` otherwise; at most 3 in a burst, then one per 2 s (`rate_limited`) |
+| activity | kind: `shop_sell` or `shop_buy`, bells: integer 1..9,999,999, optional npc: the merchant actor id 0xd000..0xd0ff (relayed as `npc`; clients name it) | a `notice` to every notice-capable session, the sender included; `invalid_activity` otherwise; at most 3 in a burst, then one per 2 s (`rate_limited`) |
 
 **Notices (NOTICE155).** A client that can decode them sends the request header
 `X-ACWW-Chat-Features: notice_v1` when it opens the socket, and `hello.capabilities`

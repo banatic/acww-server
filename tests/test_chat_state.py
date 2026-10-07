@@ -206,3 +206,18 @@ def test_activity_is_validated_and_rate_limited():
     clock[0] += 2.0
     hub.activity(s, "shop_buy", 80)
     assert len(drain(s)) == 4
+
+
+def test_activity_carries_an_optional_merchant_id():
+    clock = [1000.0]
+    hub = ChatHub(clock=lambda: clock[0])
+    s = hub.attach(1, "alpha", notices=True)
+    drain(s)
+    hub.activity(s, "shop_buy", 1200, 0xd010)
+    hub.activity(s, "shop_sell", 5)
+    first, second = drain(s)
+    assert first["npc"] == 0xd010 and "npc" not in second
+    clock[0] += 10
+    for bad in (0xcfff, 0xd100, "0xd010", 1.0, True):
+        with pytest.raises(ChatError, match="invalid_activity"):
+            hub.activity(s, "shop_buy", 1, bad)

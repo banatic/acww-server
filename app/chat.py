@@ -164,7 +164,8 @@ class ChatHub:
             self.notice("join", session, include_self=False)
         return session
 
-    def activity(self, session: ChatSession, kind: object, bells: object) -> dict:
+    def activity(self, session: ChatSession, kind: object, bells: object,
+                 npc: object = None) -> dict:
         """A client-reported game event (a shop sale or purchase), broadcast as a notice.
 
         Only the kind and the amount come from the client; the name is the session's."""
@@ -172,6 +173,9 @@ class ChatHub:
         if kind not in ACTIVITY_KINDS:
             raise ChatError("invalid_activity")
         if type(bells) is not int or not 1 <= bells <= MAX_BELLS:
+            raise ChatError("invalid_activity")
+        # MERCHANTS155: optional, the merchant's actor id (0xd000..0xd0ff); clients name it.
+        if npc is not None and (type(npc) is not int or not 0xd000 <= npc <= 0xd0ff):
             raise ChatError("invalid_activity")
         now = self.clock()
         tokens, previous = self.activity_rates.get(session.user_id, (3.0, now))
@@ -183,7 +187,10 @@ class ChatHub:
         self.activity_rates.move_to_end(session.user_id)
         while len(self.activity_rates) > 4096:
             self.activity_rates.popitem(last=False)
-        return self.notice(kind, session, bells=bells)
+        extra = {"bells": bells}
+        if npc is not None:
+            extra["npc"] = npc
+        return self.notice(kind, session, **extra)
 
     def touch(self, session: ChatSession) -> None:
         self.require(session)

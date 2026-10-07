@@ -31,7 +31,7 @@ from pathlib import Path
 # because func_02050b78 identifies the chip as 1 << 0x12 bytes.  See app/savecheck.py.
 CARD_IMAGE_SIZE = 0x40000
 
-SERVICE_VERSION = "1.1.0"   # 1.1.0: NOTICE155 chat notices (notice_v1)
+SERVICE_VERSION = "1.2.0"   # 1.1.0: NOTICE155 chat notices; 1.2.0: merchant id on shop notices
 
 
 def _env_int(name: str, default: int) -> int:

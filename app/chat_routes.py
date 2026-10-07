@@ -103,7 +103,7 @@ def install_chat(app, settings, store, lobby, client_key):
                     elif kind == "resume":
                         hub.resume(session, msg.get("epoch"), msg.get("seq"))
                     elif kind == "activity":
-                        hub.activity(session, msg.get("kind"), msg.get("bells"))
+                        hub.activity(session, msg.get("kind"), msg.get("bells"), msg.get("npc"))
                     elif kind == "ping":
                         hub.emit(session, {"v": 1, "t": "pong"})
                     elif kind == "pong":
