@@ -1,0 +1,2 @@
+# The NAS runs these with /bin/sh: a CR at a line end breaks them.
+*.sh text eol=lf

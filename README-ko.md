@@ -286,3 +286,38 @@ HTTPS 인증서가 필요합니다. `--offline`, headless 진단, HTTP, `--insec
 남기고 `acww.exe.update-<PID>.previous`에 이전 EXE를 보관합니다. 새 버전 자체에 문제가
 있다면 모든 게임 창을 닫고 이 백업을 `acww.exe`로 복원하세요. 파일 교체·시작 실패는
 자동 복원을 시도하지만, 프로세스 시작 후 발생한 게임 오류까지 자동 판정하지는 않습니다.
+
+## 서버 자동 업데이트 (DSM 작업 스케줄러)
+
+컨테이너를 따로 추가하지 않고, DSM의 **작업 스케줄러**가 `tools/nas-auto-update.sh`를 주기적으로
+실행해서 서버를 최신으로 유지합니다. 서버 코드는 공개 저장소 `banatic/acww-server`에서 받으므로
+토큰이 필요 없습니다.
+
+스크립트가 매번 하는 일:
+
+1. GitHub에서 최신 커밋을 확인하고, 이미 배포한 커밋이면 아무것도 하지 않습니다.
+2. NAS 안에서 `http://127.0.0.1:8080/v1/health`를 읽어 **로비 대기(`waiting`)나 진행 중인
+   방(`rooms`)이 하나라도 있으면 다음 차례로 미룹니다.** 멀티플레이 도중에 끊기지 않습니다.
+3. 그 커밋을 받아 프로젝트 폴더의 `app/`, `Dockerfile`, `requirements.txt`, `.dockerignore`만
+   바꿉니다(이전 것은 `.prev`로 보관). **`data/`와 `docker-compose.yml`은 건드리지 않습니다.**
+4. `docker compose up -d --build`로 이미지를 다시 만들고 컨테이너를 교체한 뒤 health가 살아나는지
+   확인합니다. 성공하면 이름 없는 옛 이미지를 정리합니다(`docker image prune -f`).
+5. 새 서버가 2분 안에 살아나지 않으면 이전 파일로 되돌려 다시 빌드합니다.
+
+기록은 프로젝트 폴더의 `update.log`, 배포한 커밋은 `.deployed_commit`에 남습니다.
+
+### 설정 (한 번만)
+
+1. 이 저장소의 `tools/nas-auto-update.sh`를 NAS의 `/volume1/docker/acww-online/auto-update.sh`로
+   복사합니다. 프로젝트 폴더가 다른 볼륨이면 파일 맨 위의 `PROJECT_DIR`을 고치세요.
+2. **제어판 → 작업 스케줄러 → 생성 → 예약된 작업 → 사용자 정의 스크립트**
+   - 일반: 작업 이름 `acww 서버 업데이트`, 사용자 **root**
+   - 일정: 매일, 첫 실행 00:00, 반복 **30분마다**
+   - 작업 설정 → 사용자 정의 스크립트: `sh /volume1/docker/acww-online/auto-update.sh`
+3. 만든 작업을 선택하고 **실행**을 한 번 눌러 `update.log`에 `ok:`가 찍히는지 확인합니다.
+   (처음 실행에는 `.deployed_commit`이 없으므로, 아무도 없을 때 최신 서버를 한 번 배포합니다.)
+
+멈추려면 작업 스케줄러에서 작업을 **사용 안 함**으로 바꾸면 됩니다. 스크립트 자체는 업데이트로
+바뀌지 않으므로, 스크립트가 바뀐 경우에만 1번을 다시 하면 됩니다.
+
+테스트(Docker 없이, 실제 GitHub 다운로드 + 가짜 docker/health): `PY=python sh tools/test_nas_auto_update.sh`
