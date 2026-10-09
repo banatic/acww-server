@@ -103,6 +103,11 @@ class Store:
         with self._lock:
             return int(self._db.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"])
 
+    def all_users(self) -> list[sqlite3.Row]:
+        """Every account, oldest first (the admin listing)."""
+        with self._lock:
+            return self._db.execute("SELECT * FROM users ORDER BY id").fetchall()
+
     def all_usernames(self) -> list[str]:
         with self._lock:
             return [r["username"] for r in

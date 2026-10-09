@@ -13,6 +13,7 @@ their own `Settings` and call `create_app()` several times in one process.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import re
 import threading
@@ -464,6 +465,100 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   size=len(data))
         return Response(content=data, media_type="application/octet-stream",
                         headers={"ETag": _etag(version), "X-Save-Sha256": row["sha256"]})
+
+    # ----------------------------------------------------------------- admin
+    #
+    # Any account's save, read and written, for repairing a player's data (a corrupted
+    # nickname byte, 2026-10-09). Off unless `ACWW_ADMIN_TOKEN` is set: the routes then answer
+    # 404 as if they did not exist. The token travels in `X-Admin-Token`, is compared in
+    # constant time, and is never logged; every attempt, good or bad, spends one of the auth
+    # rate limiter's attempts, so the token cannot be guessed faster than a password.
+
+    def _admin(request: Request, token: str | None) -> None:
+        if not settings.admin_token:
+            raise HTTPException(status_code=404, detail="Not Found")
+        _spend_attempt(request, "admin")
+        if not token or not hmac.compare_digest(token.encode("utf-8"),
+                                                settings.admin_token.encode("utf-8")):
+            log.event("admin.denied", level="warn", ip=_client_key(request, settings))
+            raise HTTPException(status_code=401, detail="a valid X-Admin-Token is required")
+
+    def _admin_user(username: str) -> Any:
+        row = store.user_by_name(username)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such user")
+        return row
+
+    @app.get("/v1/admin/users")
+    async def admin_users(request: Request,
+                          x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+        _admin(request, x_admin_token)
+        rows = await run_in_threadpool(store.all_users)
+        out = [{"user_id": int(r["id"]), "username": r["username"],
+                "save": _save_summary(store.latest_version(int(r["id"])))} for r in rows]
+        log.event("admin.users", count=len(out))
+        return JSONResponse(out)
+
+    @app.get("/v1/admin/users/{username}/save")
+    async def admin_get_save(username: str, request: Request, version: int | None = None,
+                             x_admin_token: str | None = Header(default=None)) -> Response:
+        _admin(request, x_admin_token)
+        user = _admin_user(username)
+        user_id = int(user["id"])
+        row = (store.version_row(user_id, version) if version is not None
+               else store.latest_version(user_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such save version")
+        data = await run_in_threadpool(store.read_save, user_id, int(row["version"]))
+        if data is None:
+            raise HTTPException(status_code=500, detail="the stored save file is missing")
+        log.event("admin.save_get", user_id=user_id, version=int(row["version"]),
+                  size=len(data), sha256=row["sha256"])
+        return Response(content=data, media_type="application/octet-stream",
+                        headers={"ETag": _etag(int(row["version"])),
+                                 "X-Save-Sha256": row["sha256"]})
+
+    @app.put("/v1/admin/users/{username}/save")
+    async def admin_put_save(username: str, request: Request,
+                             x_admin_token: str | None = Header(default=None),
+                             if_match: str | None = Header(default=None)) -> JSONResponse:
+        """A new version for `username`, validated exactly as the player's own upload is.
+        The old versions stay in the history, so a repair can always be undone."""
+        _admin(request, x_admin_token)
+        user = _admin_user(username)
+        user_id = int(user["id"])
+        expect = _parse_if_match(if_match)
+        if expect == IF_MATCH_INVALID:
+            raise HTTPException(status_code=428, detail="If-Match must be one exact version or *")
+        data = await _read_bounded(request, SAVE_BYTES + 1)
+        try:
+            validate_card_image(data)
+        except SaveRejected as bad:
+            log.event("admin.save_rejected", level="warn", user_id=user_id, size=len(data),
+                      reason=bad.reason)
+            raise HTTPException(status_code=400, detail=bad.reason)
+        latest = store.latest_version(user_id)
+        current = int(latest["version"]) if latest else 0
+        if expect == IF_MATCH_ANY:
+            if latest is None:
+                raise HTTPException(status_code=412, detail="there is no save to match")
+            expect = current
+        if expect == IF_MATCH_ABSENT:
+            expect = None
+        if expect is not None and expect != current:
+            raise HTTPException(status_code=412,
+                                detail="If-Match is version %d but the server holds version %d"
+                                       % (expect, current))
+        digest = sha256_hex(data)
+        result = await run_in_threadpool(store.put_save, user_id, data, digest, expect)
+        if result is None:
+            raise HTTPException(status_code=412,
+                                detail="another client wrote a newer version; re-read it")
+        version, stamp = result
+        log.event("admin.save_put", user_id=user_id, version=version, size=len(data),
+                  sha256=digest, if_match=expect)
+        return JSONResponse({"version": version, "sha256": digest, "updated_utc": stamp},
+                            headers={"ETag": _etag(version)})
 
     # ----------------------------------------------------------------- lobby
 

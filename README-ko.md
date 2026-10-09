@@ -70,6 +70,7 @@ PC로 포팅한 《동물의 숲 - 튀어나와요 동물의 숲》(한국판 AD
 | `ACWW_TOKEN_DAYS` | `30` | 로그인 유효 기간(일) |
 | `ACWW_AUTH_RATE_LIMIT` / `_WINDOW` | `10` / `60` | IP당 60초에 로그인·가입 시도 10번 |
 | `ACWW_INVITE_TTL` | `60` | 보낸 초대가 유효한 시간(초). 지나면 수락해도 거절됩니다 |
+| `ACWW_ADMIN_TOKEN` | (없음 → 관리자 기능 꺼짐) | 관리자 세이브 내려받기/올리기용 토큰. **24자 이상**이어야 켜집니다. 비워 두면 `/v1/admin` 주소가 아예 없는 것처럼 404를 돌려줍니다 |
 | `ACWW_MAX_LOBBY_SOCKETS` / `ACWW_MAX_ROOMS` | `32` / `16` | 서버 한 대가 동시에 들고 있을 로비 연결 수와 통신 중인 쌍의 수 |
 
 **나머지 상한값은 손댈 일이 없습니다.** 요청 크기·비밀번호 길이·초당 메시지 수 같은 것들은
@@ -321,3 +322,22 @@ HTTPS 인증서가 필요합니다. `--offline`, headless 진단, HTTP, `--insec
 바뀌지 않으므로, 스크립트가 바뀐 경우에만 1번을 다시 하면 됩니다.
 
 테스트(Docker 없이, 실제 GitHub 다운로드 + 가짜 docker/health): `PY=python sh tools/test_nas_auto_update.sh`
+
+## 관리자: 다른 사용자의 세이브 내려받기/올리기 (ADMIN172)
+
+플레이어 세이브를 고쳐야 할 때(예: 깨진 호칭 바이트) 쓰는 기능입니다. 기본은 꺼져 있습니다.
+
+1. Container Manager 의 환경 변수에 `ACWW_ADMIN_TOKEN` 을 24자 이상의 임의 문자열로 넣고
+   컨테이너를 다시 만듭니다(`docker-compose.yml` 의 `environment:` 에 이미 자리가 있습니다).
+   토큰은 비밀번호처럼 다루세요. 로그에는 절대 남지 않습니다.
+2. PC에서 `server/tools/admin_save.py` 로 씁니다.
+
+```
+python server/tools/admin_save.py --url https://<서버주소> users
+python server/tools/admin_save.py --url https://<서버주소> get 민성계정 --out 민성.sav
+python server/tools/admin_save.py --url https://<서버주소> put 민성계정 민성-fixed.sav
+```
+
+토큰은 `ACWW_ADMIN_TOKEN` 환경 변수로 넘깁니다(명령줄에 쓰지 않습니다). 올린 세이브는 **새 버전**으로
+저장되고 이전 버전은 기록에 남아서, `get --version N` 으로 언제든 되돌릴 수 있습니다. 올릴 때는 일반
+업로드와 똑같이 카드 이미지 검사를 통과해야 합니다.

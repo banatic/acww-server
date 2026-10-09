@@ -31,7 +31,7 @@ from pathlib import Path
 # because func_02050b78 identifies the chip as 1 << 0x12 bytes.  See app/savecheck.py.
 CARD_IMAGE_SIZE = 0x40000
 
-SERVICE_VERSION = "1.2.0"   # 1.1.0: NOTICE155 chat notices; 1.2.0: merchant id on shop notices
+SERVICE_VERSION = "1.3.0"   # 1.1.0: NOTICE155 chat notices; 1.2.0: merchant id on shop notices; 1.3.0: ADMIN172 admin save routes
 
 
 def _env_int(name: str, default: int) -> int:
@@ -118,6 +118,11 @@ class Settings:
     chat_enabled: bool = True
     max_chat_sockets: int = 128
 
+    # ADMIN. `ACWW_ADMIN_TOKEN` turns on the /v1/admin routes (any user's save, read and
+    # written). Unset, or shorter than ADMIN_TOKEN_MIN, means the routes answer 404 as if
+    # they did not exist. The token is compared in constant time and never logged.
+    admin_token: str = ""
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "acww.sqlite"
@@ -163,7 +168,17 @@ class Settings:
             max_rooms=_env_int("ACWW_MAX_ROOMS", 16),
             chat_enabled=_env_bool("ACWW_CHAT_ENABLED", True),
             max_chat_sockets=max(1, min(128, _env_int("ACWW_MAX_CHAT_SOCKETS", 128))),
+            admin_token=_admin_token(),
         )
+
+
+ADMIN_TOKEN_MIN = 24
+
+
+def _admin_token() -> str:
+    """`ACWW_ADMIN_TOKEN`, or "" (admin routes off) when unset or too short to be a secret."""
+    raw = (os.environ.get("ACWW_ADMIN_TOKEN") or "").strip()
+    return raw if len(raw) >= ADMIN_TOKEN_MIN else ""
 
 
 def _resolve_secret(data_dir: Path) -> tuple[str, bool]:
