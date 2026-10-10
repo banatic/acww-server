@@ -118,3 +118,76 @@ def test_admin_save_tool_round_trip(admin_server, tmp_path):
     assert TOKEN not in r.stdout + r.stderr
     got = httpx.get(admin_server.base + "/v1/save", headers=auth, timeout=TIMEOUT)
     assert got.content == fixed.read_bytes()
+
+
+def _damaged_image(player="슈슈"):
+    """A synthetic image whose player is `player` and whose villager 1 calls them by the
+    0x0a-damaged nickname (NICKFIX172)."""
+    from app.savecheck import BANK2_OFF, BANK_SIZE, CHECKSUM_OFF, compute_checksum
+    img = bytearray(make_sample_image())
+    bank = bytearray(img[:BANK_SIZE])
+    name = "민성".encode("utf-16le")
+    pn = player.encode("utf-16le")
+    bank[0x14 + 0x248E:0x14 + 0x248E + len(pn)] = pn
+    for v in range(8):
+        bank[0x9284 + v * 0x7EC + 0x7AF] = 0xFF if v != 1 else 0x38
+    rec = 0x9284 + 1 * 0x7EC
+    bank[rec + 0x10:rec + 0x10 + len(name)] = name
+    bank[rec + 0x1E:rec + 0x1E + len(name)] = name
+    bank[rec + 0x20] = 0x0A                          # 민성 -> 민섊
+    ck = compute_checksum(bytes(bank))
+    bank[CHECKSUM_OFF] = ck & 0xFF
+    bank[CHECKSUM_OFF + 1] = ck >> 8
+    img[:BANK_SIZE] = bank
+    img[BANK2_OFF:BANK2_OFF + BANK_SIZE] = bank
+    return bytes(img), rec
+
+
+def test_nickfix_repairs_the_image_and_is_idempotent():
+    from app import nickfix
+    from app.savecheck import validate_card_image
+    img, rec = _damaged_image()
+    fixed, found = nickfix.repair(img)
+    assert [(f["villager"], f["offset"], f["was"], f["now"]) for f in found] == [(1, 0x20, 0xC10A, 0xC131)]
+    validate_card_image(fixed)
+    assert fixed[rec + 0x20] == 0x31
+    assert nickfix.repair(fixed) == (fixed, [])
+    assert nickfix.player_names(img) == ["슈슈"]
+
+
+def test_admin_save_tool_nickfix(admin_server, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    auth = register(admin_server, "shushu")
+    img, rec = _damaged_image()
+    assert player_put(admin_server, auth, img).status_code == 200
+    tool = Path(__file__).resolve().parents[1] / "tools" / "admin_save.py"
+    env = dict(os.environ, ACWW_ADMIN_TOKEN=TOKEN, PYTHONIOENCODING="utf-8")
+    run = lambda *a: subprocess.run([sys.executable, str(tool), "--url", admin_server.base, *a],
+                                    env=env, capture_output=True, text=True, encoding="utf-8",
+                                    timeout=TIMEOUT)
+    dry = run("nickfix", "--player", "슈슈", "--dry-run", "--backup", str(tmp_path / "b"))
+    assert dry.returncode == 0, dry.stderr
+    assert "1 damaged" in dry.stdout
+    assert httpx.get(admin_server.base + "/v1/save", headers=auth, timeout=TIMEOUT).content == img
+    r = run("nickfix", "--player", "슈슈", "--backup", str(tmp_path / "b"))
+    assert r.returncode == 0, r.stderr
+    got = httpx.get(admin_server.base + "/v1/save", headers=auth, timeout=TIMEOUT)
+    assert got.headers["ETag"] == '"2"'
+    assert got.content[rec + 0x20] == 0x31
+    assert (tmp_path / "b" / "shushu-v1.sav").read_bytes() == img
+    again = run("nickfix", "--player", "슈슈", "--backup", str(tmp_path / "b"))
+    assert "clean" in again.stdout
+
+
+def test_admin_token_is_generated_into_the_data_dir(tmp_path, monkeypatch):
+    from app.config import ADMIN_TOKEN_MIN, _admin_token
+    monkeypatch.delenv("ACWW_ADMIN_TOKEN", raising=False)
+    first = _admin_token(tmp_path)
+    assert len(first) >= ADMIN_TOKEN_MIN
+    assert (tmp_path / "admin.key").read_text(encoding="ascii").strip() == first
+    assert _admin_token(tmp_path) == first            # stable across restarts
+    monkeypatch.setenv("ACWW_ADMIN_TOKEN", "x" * 30)
+    assert _admin_token(tmp_path) == "x" * 30         # the environment wins

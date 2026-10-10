@@ -31,7 +31,7 @@ from pathlib import Path
 # because func_02050b78 identifies the chip as 1 << 0x12 bytes.  See app/savecheck.py.
 CARD_IMAGE_SIZE = 0x40000
 
-SERVICE_VERSION = "1.3.0"   # 1.1.0: NOTICE155 chat notices; 1.2.0: merchant id on shop notices; 1.3.0: ADMIN172 admin save routes
+SERVICE_VERSION = "1.3.1"   # 1.1.0: NOTICE155 chat notices; 1.2.0: merchant id on shop notices; 1.3.0: ADMIN172 admin save routes; 1.3.1: admin token in data/admin.key, nickfix
 
 
 def _env_int(name: str, default: int) -> int:
@@ -118,9 +118,10 @@ class Settings:
     chat_enabled: bool = True
     max_chat_sockets: int = 128
 
-    # ADMIN. `ACWW_ADMIN_TOKEN` turns on the /v1/admin routes (any user's save, read and
-    # written). Unset, or shorter than ADMIN_TOKEN_MIN, means the routes answer 404 as if
-    # they did not exist. The token is compared in constant time and never logged.
+    # ADMIN. The /v1/admin routes (any user's save, read and written) take this token:
+    # `ACWW_ADMIN_TOKEN`, else <data>/admin.key generated on first run (_admin_token). Empty
+    # means the routes answer 404 as if they did not exist. Compared in constant time, never
+    # logged, never in the repository (server/ is mirrored publicly).
     admin_token: str = ""
 
     @property
@@ -168,17 +169,34 @@ class Settings:
             max_rooms=_env_int("ACWW_MAX_ROOMS", 16),
             chat_enabled=_env_bool("ACWW_CHAT_ENABLED", True),
             max_chat_sockets=max(1, min(128, _env_int("ACWW_MAX_CHAT_SOCKETS", 128))),
-            admin_token=_admin_token(),
+            admin_token=_admin_token(data_dir),
         )
 
 
 ADMIN_TOKEN_MIN = 24
 
 
-def _admin_token() -> str:
-    """`ACWW_ADMIN_TOKEN`, or "" (admin routes off) when unset or too short to be a secret."""
+def _admin_token(data_dir: Path) -> str:
+    """The admin token: `ACWW_ADMIN_TOKEN` when set (24+ characters), else `<data>/admin.key`,
+    generated on first run like secret.key. NEVER in the repository: server/ is mirrored to a
+    PUBLIC GitHub repository and its address is in every client, so a token in the source would
+    hand every player's save to anyone. The file lives only in the private data volume; copy it
+    to the admin PC once (`%USERPROFILE%\.acww-admin-token`, server/tools/admin_save.py)."""
     raw = (os.environ.get("ACWW_ADMIN_TOKEN") or "").strip()
-    return raw if len(raw) >= ADMIN_TOKEN_MIN else ""
+    if raw:
+        return raw if len(raw) >= ADMIN_TOKEN_MIN else ""
+    keyfile = data_dir / "admin.key"
+    if keyfile.is_file():
+        stored = keyfile.read_text(encoding="ascii").strip()
+        if len(stored) >= ADMIN_TOKEN_MIN:
+            return stored
+    generated = secrets.token_urlsafe(32)
+    keyfile.write_text(generated, encoding="ascii")
+    try:
+        keyfile.chmod(0o600)
+    except OSError:
+        pass
+    return generated
 
 
 def _resolve_secret(data_dir: Path) -> tuple[str, bool]:

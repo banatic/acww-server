@@ -325,19 +325,27 @@ HTTPS 인증서가 필요합니다. `--offline`, headless 진단, HTTP, `--insec
 
 ## 관리자: 다른 사용자의 세이브 내려받기/올리기 (ADMIN172)
 
-플레이어 세이브를 고쳐야 할 때(예: 깨진 호칭 바이트) 쓰는 기능입니다. 기본은 꺼져 있습니다.
+플레이어 세이브를 고쳐야 할 때(예: 깨진 호칭 바이트) 쓰는 기능입니다.
 
-1. Container Manager 의 환경 변수에 `ACWW_ADMIN_TOKEN` 을 24자 이상의 임의 문자열로 넣고
-   컨테이너를 다시 만듭니다(`docker-compose.yml` 의 `environment:` 에 이미 자리가 있습니다).
-   토큰은 비밀번호처럼 다루세요. 로그에는 절대 남지 않습니다.
-2. PC에서 `server/tools/admin_save.py` 로 씁니다.
+**토큰은 코드에 넣지 않습니다.** `server/` 는 GitHub 공개 저장소로 올라가고 서버 주소는 모든
+클라이언트에 들어 있어서, 코드에 적힌 토큰은 누구나 모든 세이브를 읽고 덮어쓸 수 있게 만듭니다.
+대신 서버가 처음 켜질 때 토큰을 만들어 **`./data/admin.key`** 에 저장합니다(`secret.key` 와 같은
+방식, 저장소에는 절대 올라가지 않음).
+
+1. NAS 의 `acww-online/data/admin.key` 파일 내용을 복사해서, 관리자 PC 의
+   `%USERPROFILE%\.acww-admin-token` 파일(예: `C:\Users\<이름>\.acww-admin-token`)에 붙여 넣습니다.
+   한 번만 하면 됩니다. (환경 변수 `ACWW_ADMIN_TOKEN` 을 쓰면 그 값이 우선합니다.)
+2. PC 에서:
 
 ```
 python server/tools/admin_save.py --url https://<서버주소> users
-python server/tools/admin_save.py --url https://<서버주소> get 민성계정 --out 민성.sav
-python server/tools/admin_save.py --url https://<서버주소> put 민성계정 민성-fixed.sav
+python server/tools/admin_save.py --url https://<서버주소> get 계정이름 --out 백업.sav
+python server/tools/admin_save.py --url https://<서버주소> put 계정이름 고친.sav
+python server/tools/admin_save.py --url https://<서버주소> nickfix --player 슈슈 --dry-run
+python server/tools/admin_save.py --url https://<서버주소> nickfix --player 슈슈
 ```
 
-토큰은 `ACWW_ADMIN_TOKEN` 환경 변수로 넘깁니다(명령줄에 쓰지 않습니다). 올린 세이브는 **새 버전**으로
-저장되고 이전 버전은 기록에 남아서, `get --version N` 으로 언제든 되돌릴 수 있습니다. 올릴 때는 일반
-업로드와 똑같이 카드 이미지 검사를 통과해야 합니다.
+`nickfix` 는 게임 속 이름으로 세이브를 찾아, 주민이 부르는 호칭의 깨진 바이트("민@" 문제)를
+클라이언트와 같은 규칙으로 고치고 **새 버전**으로 올립니다. 원본은 `nickfix-backup\` 에 남고,
+서버 기록에도 이전 버전이 남습니다. 플레이어가 게임을 켜 둔 동안 저장이 일어나면 버전이 달라져
+업로드가 거절되므로(덮어쓰기 방지), 상대가 게임을 끈 상태에서 돌리세요.
