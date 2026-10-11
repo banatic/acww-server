@@ -191,3 +191,38 @@ def test_admin_token_is_generated_into_the_data_dir(tmp_path, monkeypatch):
     assert _admin_token(tmp_path) == first            # stable across restarts
     monkeypatch.setenv("ACWW_ADMIN_TOKEN", "x" * 30)
     assert _admin_token(tmp_path) == "x" * 30         # the environment wins
+
+
+def test_nickfix_name175_restores_the_name_and_clears_the_stranger_record():
+    """NAME175: counters (0..10) written into record 0's +0x19..+0x20 changed the player's
+    NAME, the villager made a second record for the 'stranger'; both are repaired."""
+    from app import nickfix
+    from app.savecheck import BANK2_OFF, BANK_SIZE, CHECKSUM_OFF, compute_checksum, validate_card_image
+    img = bytearray(make_sample_image())
+    bank = bytearray(img[:BANK_SIZE])
+    ident = bytes.fromhex("ccefa9cd09bd0000000000000000") + bytes.fromhex("66a5fcbb31c1") + bytes(8)
+    bank[0x14 + 0x247E:0x14 + 0x247E + 0x1C] = ident
+    for v in range(8):
+        bank[0x9284 + v * 0x7EC + 0x7AF] = 0xFF if v != 3 else 0x20
+    rec = 0x9284 + 3 * 0x7EC
+    healthy = bytearray(0x80)
+    healthy[0:0x1C] = ident
+    healthy[0x1E:0x22] = "민성".encode("utf-16le")
+    bank[rec:rec + 0x80] = healthy
+    bank[rec + 0x80:rec + 0x100] = healthy                     # the stranger record
+    for off, val in ((0x19, 1), (0x1A, 10), (0x1B, 3), (0x1D, 1), (0x1F, 10), (0x20, 10)):
+        bank[rec + off] = val                                    # 민성 -> 민성..<0100><030a>
+    ck = compute_checksum(bytes(bank))
+    bank[CHECKSUM_OFF] = ck & 0xFF
+    bank[CHECKSUM_OFF + 1] = ck >> 8
+    img[:BANK_SIZE] = bank
+    img[BANK2_OFF:BANK2_OFF + BANK_SIZE] = bank
+    fixed, found = nickfix.repair(bytes(img))
+    validate_card_image(fixed)
+    assert fixed[rec:rec + 0x80] == bytes(healthy)
+    empty = bytearray(0x80)
+    empty[0x1C], empty[0x6A], empty[0x6B] = 2, 0xF1, 0xFF
+    assert fixed[rec + 0x80:rec + 0x100] == bytes(empty)
+    assert fixed[BANK2_OFF + rec:BANK2_OFF + rec + 0x100] == fixed[rec:rec + 0x100]
+    assert any("duplicate" in f["what"] for f in found)
+    assert nickfix.repair(fixed) == (fixed, [])

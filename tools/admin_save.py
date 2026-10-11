@@ -75,8 +75,9 @@ def nickfix(base: str, token: str, a: argparse.Namespace) -> int:
             continue
         print("%s: %d damaged nickname(s)" % (label, len(found)))
         for f in found:
-            print("    villager %d +0x%x  %04x -> %04x  (%s)" % (f["villager"], f["offset"],
-                                                           f["was"], f["now"], f["name"]))
+            print("    villager %d +0x%x  %04x -> %04x  (%s) %s" % (f["villager"], f["offset"],
+                                                              f["was"], f["now"], f["name"],
+                                                              f.get("what", "")))
         if a.dry_run:
             continue
         if not version.isdigit():
