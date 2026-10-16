@@ -323,6 +323,43 @@ HTTPS 인증서가 필요합니다. `--offline`, headless 진단, HTTP, `--insec
 
 테스트(Docker 없이, 실제 GitHub 다운로드 + 가짜 docker/health): `PY=python sh tools/test_nas_auto_update.sh`
 
+## 관리자: 계정 만들기와 웹으로 플레이하기 (WEB05)
+
+클로즈드 베타라 **회원가입은 닫고**(`ACWW_ALLOW_REGISTER: "0"`, Container Manager 에서 직접
+바꿔야 합니다 -- 자동 업데이트는 NAS 의 compose 를 건드리지 않음) 계정은 관리자만 만듭니다.
+게임(EXE, 웹)에도 가입 버튼과 오프라인 플레이가 없습니다.
+
+```
+powershell -ExecutionPolicy Bypass -File server\tools\add-user.ps1
+powershell -ExecutionPolicy Bypass -File server\tools\add-user.ps1 -Username 친구아이디 -Save "D:\세이브.sav"
+```
+
+토큰은 아래 ADMIN172 절과 같은 `%USERPROFILE%\.acww-admin-token` 을 씁니다. 아이디와 비밀번호(두 번,
+화면에 안 보임)를 묻고, **기존 세이브를 옮길지** 묻습니다. 고르면 그 세이브가 계정의 첫 클라우드
+세이브(버전 1)가 되어 첫 로그인 때 그 마을로 시작합니다. 262,144 바이트 카드 이미지(EXE 의 세이브,
+대부분의 에뮬레이터 `.sav`)와 DeSmuME `.dsv` 를 받고, 서버와 같은 검사(한국판인지, 두 뱅크 체크섬)를
+**계정을 만들기 전에** 해서, 못 쓰는 파일이면 계정도 만들지 않습니다.
+
+**웹 플레이 배포.** PC 에서 두 줄이면 됩니다(관리자 토큰은 위와 같은 파일):
+
+```
+python port/wasm/build.py
+python port/wasm/web/bundle.py --publish
+```
+
+`--publish` 가 웹 묶음을 zip 으로 묶어 `PUT /v1/admin/web` 로 올리면, 서버가 통째로 검사한 뒤
+`data/web/` 으로 바꿔 끼웁니다(이전 판은 `data/web.prev/` 에 하나 남음). 그 순간부터
+`https://<서버주소>/` 에서 새 판이 플레이됩니다. **서버 자동 업데이트로는 같이 갈 수 없습니다** --
+자동 업데이트는 공개 GitHub 저장소에서 받는데, 웹 묶음은 게임 자체라 거기 올리면 공개됩니다.
+(손으로 하려면 `dist/web/` 의 내용물을 `data/web/` 에 uid 10001 이 읽을 수 있게 복사해도 같습니다.)
+API 경로가 항상 먼저 응답하고, 폴더가 없으면 페이지는 404 입니다. 롬은 들어 있지 않습니다: 각자
+자기 `.nds` 를 한 번 고르면 그 기기 안에만 보관됩니다.
+
+**`429` 가 뜨면.** 로그인은 IP 하나당 60초에 10번까지입니다(`ACWW_AUTH_RATE_LIMIT`). 1분 기다리면
+풀립니다. Synology 역방향 프록시 뒤에서 `ACWW_TRUSTED_PROXIES` 가 비어 있으면 **모든 사용자가 프록시
+IP 하나로 보여서 이 10번을 다 같이 나눠 씁니다** -- compose 의 `ACWW_TRUSTED_PROXIES:
+"127.0.0.1, 172.16.0.0/12"` 가 NAS 컨테이너 설정에도 들어 있는지 확인하세요.
+
 ## 관리자: 다른 사용자의 세이브 내려받기/올리기 (ADMIN172)
 
 플레이어 세이브를 고쳐야 할 때(예: 깨진 호칭 바이트) 쓰는 기능입니다.

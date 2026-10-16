@@ -32,9 +32,14 @@ def install_chat(app, settings, store, lobby, client_key):
         if not settings.chat_enabled or not handshakes.spend(client_key(ws, settings)):
             await ws.close(code=1013)
             return
-        # New protocol has no query-token compatibility path.
+        # The `Authorization` header first. WEB05: a browser websocket cannot set headers, so
+        # the page served from this host sends `?token=` (and `?features=`); the query string
+        # is redacted from the logs like the lobby socket's (main.py `_ws_token`).
         header = ws.headers.get("authorization", "")
-        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+        else:
+            token = ws.query_params.get("token", "")
         claims = read_token(settings.secret, token)
         try:
             user = store.user_by_id(int(claims["sub"])) if claims else None
@@ -47,7 +52,8 @@ def install_chat(app, settings, store, lobby, client_key):
         await ws.accept()
         # NOTICE155: a client that can decode `notice` events says so in this header; an
         # older client never sees one (it would treat the unknown type as a protocol error).
-        features = {f.strip() for f in ws.headers.get("x-acww-chat-features", "").split(",")}
+        features = {f.strip() for f in (ws.headers.get("x-acww-chat-features")
+                                         or ws.query_params.get("features", "")).split(",")}
         try:
             session = hub.attach(int(user["id"]), user["username"],
                                  notices=NOTICE_FEATURE in features)

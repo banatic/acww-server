@@ -26,7 +26,9 @@ services:
       ACWW_SERVER_SECRET: "${ACWW_SERVER_SECRET:-}"
       # ADMIN172: optional override; unset, the token is generated into ./data/admin.key (README-ko.md).
       ACWW_ADMIN_TOKEN: "${ACWW_ADMIN_TOKEN:-}"
-      ACWW_ALLOW_REGISTER: "1"      # set to 0 once the household's accounts exist
+      # CLOSED BETA (WEB05): accounts are made by the operator (tools/add-user.ps1, POST
+      # /v1/admin/users with the admin token); nobody can sign themselves up.
+      ACWW_ALLOW_REGISTER: "0"
       # SERVERFIX108 / F1. The addresses whose `X-Forwarded-For` is believed -- and ONLY
       # those. `ACWW_TRUST_PROXY: "1"` used to be here and was not safe on its own: it made
       # the limiter read the header's FIRST element, which the documented appending nginx

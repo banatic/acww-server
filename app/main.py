@@ -15,14 +15,17 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import mimetypes
 import re
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
+from starlette.staticfiles import StaticFiles
 
 from . import logging_ as log
 from .config import SERVICE_VERSION, Settings
@@ -35,6 +38,7 @@ from .security import (HASHER, Budget, RateLimiter, hash_password, is_trusted_pr
 from .store import Store
 from .updates import Updates, UpdateUnavailable, DownloadResponse, CHUNK
 from .chat_routes import install_chat
+from . import webbundle
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,24}$")
 MIN_PASSWORD = 8
@@ -144,6 +148,20 @@ def _save_summary(row: Any) -> dict | None:
         "sha256": row["sha256"],
         "updated_utc": row["updated_utc"],
     }
+
+
+class _WebFiles(StaticFiles):
+    """`<data>/web/` (WEB05), or a plain 404 for every path while no bundle has been put there
+    -- Starlette's own answer to a missing directory is a 500."""
+
+    async def check_config(self) -> None:
+        if self.directory is not None and Path(self.directory).is_dir():
+            await super().check_config()
+
+    async def get_response(self, path: str, scope) -> Response:
+        if self.directory is None or not Path(self.directory).is_dir():
+            return Response(status_code=404)
+        return await super().get_response(path, scope)
 
 
 # ------------------------------------------------------------------- the app
@@ -488,6 +506,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="no such user")
         return row
+
+    # WEB05: accounts are the operator's to create. With ACWW_ALLOW_REGISTER=0 (a closed beta)
+    # `/v1/auth/register` answers 403, and this is how an account comes to exist: the same
+    # validation, the same hash, the operator's token instead of an open door. The password
+    # is in the body and is never logged; tools/add-user.ps1 is the operator's front end.
+    @app.post("/v1/admin/users")
+    async def admin_create_user(request: Request,
+                                x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+        _admin(request, x_admin_token)
+        username, password = await _read_credentials(request)
+        if not USERNAME_RE.match(username):
+            raise HTTPException(status_code=400,
+                                detail="username must be 3..24 of [A-Za-z0-9_]")
+        if len(password) < MIN_PASSWORD:
+            raise HTTPException(status_code=400,
+                                detail="password must be at least %d characters" % MIN_PASSWORD)
+        digest = await run_in_threadpool(hash_password, password)
+        user_id = await run_in_threadpool(store.create_user, username, digest)
+        if user_id is None:
+            raise HTTPException(status_code=409, detail="that username is taken")
+        log.event("admin.user_create", user_id=user_id, username=username, hasher=HASHER)
+        return JSONResponse({"user_id": user_id, "username": username})
+
+    # WEB05: the browser build is the operator's to deliver, like data/updates/acww.exe -- it
+    # is the game and cannot come from the public repository the auto-update pulls
+    # (app/webbundle.py). The body is one zip; `port/wasm/web/bundle.py --publish` sends it.
+    @app.put("/v1/admin/web")
+    async def admin_put_web(request: Request,
+                            x_admin_token: str | None = Header(default=None)) -> JSONResponse:
+        _admin(request, x_admin_token)
+        blob = await _read_bounded(request, webbundle.MAX_UPLOAD)
+        try:
+            result = await run_in_threadpool(webbundle.install, settings.data_dir, blob)
+        except webbundle.WebBundleRejected as bad:
+            log.event("admin.web_rejected", level="warn", size=len(blob), reason=bad.reason)
+            raise HTTPException(status_code=400, detail=bad.reason)
+        log.event("admin.web_put", **result)
+        return JSONResponse(result)
 
     @app.get("/v1/admin/users")
     async def admin_users(request: Request,
@@ -1115,6 +1171,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                              "users": store.user_count(),
                              "waiting": waiting, "rooms": rooms},
                             headers={"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------ the web game
+    #
+    # WEB05: the browser build (port/wasm/web/, docs/kb/hybrid/wasm.md) is served from the same
+    # origin as the API, so it needs no proxy and no CORS. Its files are the operator's to put
+    # in `<data>/web/` (port/wasm/web/bundle.py makes the folder) -- never this repository,
+    # which is public: the bundle is the port's own code and tables, and it carries NO
+    # cartridge data. The page asks each player for their own .nds and unpacks it on their
+    # device (port/wasm/web/nds.mjs). Mounted LAST, so every API route above wins; with no
+    # bundle every path it would serve is simply 404.
+    mimetypes.add_type("text/javascript", ".mjs")
+    mimetypes.add_type("application/wasm", ".wasm")
+    app.mount("/", _WebFiles(directory=settings.data_dir / "web", html=True, check_dir=False),
+              name="web")
 
     return app
 

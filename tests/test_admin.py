@@ -226,3 +226,28 @@ def test_nickfix_name175_restores_the_name_and_clears_the_stranger_record():
     assert fixed[BANK2_OFF + rec:BANK2_OFF + rec + 0x100] == fixed[rec:rec + 0x100]
     assert any("duplicate" in f["what"] for f in found)
     assert nickfix.repair(fixed) == (fixed, [])
+
+
+def test_admin_creates_an_account_even_with_registration_closed(server_factory):
+    """WEB05: a closed beta turns registration off; the operator's token still makes accounts."""
+    srv = server_factory("admin_create", admin_token=TOKEN, allow_register=False)
+    creds = {"username": "beta_tester", "password": "a long enough password"}
+    assert httpx.post(srv.base + "/v1/auth/register", json=creds, timeout=TIMEOUT).status_code == 403
+    assert httpx.post(srv.base + "/v1/admin/users", json=creds, timeout=TIMEOUT).status_code == 401
+    adm = {"X-Admin-Token": TOKEN}
+    r = httpx.post(srv.base + "/v1/admin/users", json=creds, headers=adm, timeout=TIMEOUT)
+    assert r.status_code == 200 and r.json()["username"] == "beta_tester"
+    assert httpx.post(srv.base + "/v1/admin/users", json=creds, headers=adm,
+                      timeout=TIMEOUT).status_code == 409
+    bad = {"username": "x", "password": "a long enough password"}
+    assert httpx.post(srv.base + "/v1/admin/users", json=bad, headers=adm,
+                      timeout=TIMEOUT).status_code == 400
+    login = httpx.post(srv.base + "/v1/auth/login", json=creds, timeout=TIMEOUT)
+    assert login.status_code == 200 and login.json()["token"]
+
+
+def test_admin_create_does_not_exist_without_a_token(server):
+    r = httpx.post(server.base + "/v1/admin/users", headers={"X-Admin-Token": TOKEN},
+                   json={"username": "someone", "password": "a long enough password"},
+                   timeout=TIMEOUT)
+    assert r.status_code == 404

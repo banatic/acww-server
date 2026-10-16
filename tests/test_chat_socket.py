@@ -80,11 +80,12 @@ def test_replacing_chat_closes_only_old_chat(server):
                 assert recv(lobby)["t"] == "pong"
 
 
-def test_chat_requires_header_and_rejects_binary_or_oversized_envelopes(server):
+def test_chat_requires_a_token_and_rejects_binary_or_oversized_envelopes(server):
     token, _ = account(server, "alpha")
-    with pytest.raises((ConnectionClosed, InvalidStatus)):
-        with connect(server.ws_base + "/v1/chat/ws?token=" + token) as ws:
-            ws.recv(timeout=5)
+    for bad in ("", "?token=", "?token=" + token[:-2] + "xx"):
+        with pytest.raises((ConnectionClosed, InvalidStatus)):
+            with connect(server.ws_base + "/v1/chat/ws" + bad) as ws:
+                ws.recv(timeout=5)
     for message in (b"binary", "x" * 4097):
         with open_chat(server, token) as ws:
             recv(ws)
@@ -151,3 +152,17 @@ def test_notices_follow_the_feature_header(server):
             assert recv(a) == {"v": 1, "t": "error", "code": "invalid_activity"}
             send(old, t="ping")
             assert recv(old)["t"] == "pong"                  # the old client saw no notice
+
+
+def test_browser_page_authenticates_and_opts_into_notices_by_query(server):
+    """WEB05: a browser websocket cannot set headers; the page sends ?token= and ?features=."""
+    ta, _ = account(server, "alpha")
+    tb, _ = account(server, "bravo")
+    with connect(server.ws_base + "/v1/chat/ws?token=" + ta + "&features=notice_v1",
+                 open_timeout=5) as a:
+        hello = recv(a)
+        assert hello["t"] == "hello" and "notice_v1" in hello["capabilities"]
+        with open_chat(server, tb) as b:
+            recv(b)
+            join = recv(a)
+            assert (join["t"], join["kind"], join["username"]) == ("notice", "join", "bravo")
