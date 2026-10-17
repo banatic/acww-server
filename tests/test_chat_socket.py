@@ -166,3 +166,18 @@ def test_browser_page_authenticates_and_opts_into_notices_by_query(server):
             recv(b)
             join = recv(a)
             assert (join["t"], join["kind"], join["username"]) == ("notice", "join", "bravo")
+
+
+def test_online_lists_the_players_with_a_chat_session(server):
+    """WEB12: GET /v1/online names everyone signed in (their chat session), marks the caller."""
+    ta, aid = account(server, "alpha")
+    tb, bid = account(server, "bravo")
+    r = httpx.get(server.base + "/v1/online", headers={"Authorization": "Bearer " + tb}, timeout=10)
+    assert r.status_code == 200 and r.json() == {"users": [], "count": 0}
+    with open_chat(server, ta) as a, open_chat(server, tb) as b:
+        recv(a); recv(b)
+        got = httpx.get(server.base + "/v1/online", headers={"Authorization": "Bearer " + tb},
+                        timeout=10).json()
+        assert got["count"] == 2
+        assert [(u["username"], u["you"]) for u in got["users"]] == [("alpha", False), ("bravo", True)]
+    assert httpx.get(server.base + "/v1/online", timeout=10).status_code == 401

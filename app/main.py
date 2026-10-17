@@ -625,6 +625,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _http_budget(request, int(user["id"]))
         return JSONResponse(lobby.waiting_list())
 
+    # WEB12: who is in the game right now. Every signed-in client (the exe and the browser page)
+    # keeps one global-chat session open for as long as it plays, so the chat hub's sessions
+    # ARE the online list; a player waiting in the lobby also carries their town and mode.
+    # Names only -- the same that the chat itself shows every participant.
+    @app.get("/v1/online")
+    async def online(request: Request,
+                     authorization: str | None = Header(default=None)) -> JSONResponse:
+        user = _identify(authorization)
+        _http_budget(request, int(user["id"]))
+        hub = getattr(app.state, "chat", None)
+        sessions = [] if hub is None else [s for s in list(hub.sessions.values())
+                                           if not s.closed.is_set()]
+        waiting = {int(w["user_id"]): w for w in lobby.waiting_list()}
+        users = []
+        for s in sorted(sessions, key=lambda s: s.username.lower()):
+            row = {"user_id": s.user_id, "username": s.username, "you": s.user_id == int(user["id"])}
+            w = waiting.get(s.user_id)
+            if w:
+                row["town_name"] = w.get("town_name", "")
+                row["mode"] = w.get("mode", "")
+            users.append(row)
+        return JSONResponse({"users": users, "count": len(users)},
+                            headers={"Cache-Control": "no-store"})
+
     async def _send(socket: Any, payload: dict) -> None:
         """A push to a socket that has already gone is not an error here."""
         if socket is None:
